@@ -6,7 +6,7 @@ from datetime import datetime
 
 
 # =========================================================
-# PAGE
+# PAGE SETTINGS
 # =========================================================
 
 st.set_page_config(
@@ -15,14 +15,45 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("📊 Live Trading Signal System")
+
+# =========================================================
+# SESSION STATE
+# =========================================================
+
+if "pair" not in st.session_state:
+    st.session_state.pair = "EUR/USD"
+
+if "timeframe" not in st.session_state:
+    st.session_state.timeframe = "1min"
+
+if "data" not in st.session_state:
+    st.session_state.data = None
+
+if "signal" not in st.session_state:
+    st.session_state.signal = None
+
+if "signal_time" not in st.session_state:
+    st.session_state.signal_time = None
+
+if "signal_price" not in st.session_state:
+    st.session_state.signal_price = None
+
+if "history" not in st.session_state:
+    st.session_state.history = []
 
 
 # =========================================================
-# SETTINGS
+# API
 # =========================================================
 
 API_KEY = st.secrets.get("TWELVE_DATA_API_KEY", "")
+
+BASE_URL = "https://api.twelvedata.com/time_series"
+
+
+# =========================================================
+# PAIRS
+# =========================================================
 
 PAIRS = [
     "EUR/USD",
@@ -34,6 +65,7 @@ PAIRS = [
     "NZD/USD"
 ]
 
+
 TIMEFRAMES = {
     "1 Minute": "1min",
     "5 Minutes": "5min",
@@ -44,62 +76,26 @@ TIMEFRAMES = {
 
 
 # =========================================================
-# SIDEBAR
-# =========================================================
-
-st.sidebar.header("⚙️ Settings")
-
-pair = st.sidebar.selectbox(
-    "Pair",
-    PAIRS
-)
-
-timeframe_name = st.sidebar.selectbox(
-    "Main Timeframe",
-    list(TIMEFRAMES.keys()),
-    index=0
-)
-
-timeframe = TIMEFRAMES[timeframe_name]
-
-lookback = st.sidebar.slider(
-    "Historical Candles",
-    200,
-    1000,
-    500,
-    100
-)
-
-run_button = st.sidebar.button(
-    "🔄 Analyze Market",
-    use_container_width=True
-)
-
-
-# =========================================================
-# API DATA
+# GET DATA
 # =========================================================
 
 @st.cache_data(ttl=10)
-def get_data(symbol, interval, outputsize):
+def get_data(symbol, interval, outputsize=500):
 
     if not API_KEY:
-        return pd.DataFrame(), "API key missing"
-
-    url = "https://api.twelvedata.com/time_series"
-
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": API_KEY,
-        "format": "JSON"
-    }
+        return None, "Twelve Data API key missing."
 
     try:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "outputsize": outputsize,
+            "apikey": API_KEY,
+            "format": "JSON"
+        }
 
         response = requests.get(
-            url,
+            BASE_URL,
             params=params,
             timeout=20
         )
@@ -107,261 +103,231 @@ def get_data(symbol, interval, outputsize):
         data = response.json()
 
         if "values" not in data:
+            return None, data.get("message", "No market data received.")
 
-            message = data.get(
-                "message",
-                "No market data received."
-            )
+        df = pd.DataFrame(data["values"])
 
-            return pd.DataFrame(), message
+        required = ["datetime", "open", "high", "low", "close"]
 
-        df = pd.DataFrame(
-            data["values"]
-        )
+        for col in required:
+            if col not in df.columns:
+                return None, "Required market data missing."
 
-        df["datetime"] = pd.to_datetime(
-            df["datetime"]
-        )
-
-        numeric_columns = [
-            "open",
-            "high",
-            "low",
-            "close"
-        ]
-
-        for column in numeric_columns:
-
-            df[column] = pd.to_numeric(
-                df[column],
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(
+                df[col],
                 errors="coerce"
             )
 
-        df = df.dropna()
+        df = df.dropna().copy()
 
-        df = df.sort_values(
-            "datetime"
-        ).reset_index(drop=True)
+        df = df.sort_values("datetime").reset_index(drop=True)
 
-        return df, ""
+        return df, None
 
     except Exception as e:
-
-        return pd.DataFrame(), str(e)
+        return None, str(e)
 
 
 # =========================================================
 # INDICATORS
 # =========================================================
 
-def add_indicators(df):
+def calculate_indicators(df):
 
-    data = df.copy()
+    df = df.copy()
 
     # EMA
-    data["ema5"] = (
-        data["close"]
-        .ewm(span=5, adjust=False)
-        .mean()
-    )
+    df["ema5"] = df["close"].ewm(
+        span=5,
+        adjust=False
+    ).mean()
 
-    data["ema9"] = (
-        data["close"]
-        .ewm(span=9, adjust=False)
-        .mean()
-    )
+    df["ema9"] = df["close"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
 
-    data["ema21"] = (
-        data["close"]
-        .ewm(span=21, adjust=False)
-        .mean()
-    )
+    df["ema21"] = df["close"].ewm(
+        span=21,
+        adjust=False
+    ).mean()
 
-    data["ema50"] = (
-        data["close"]
-        .ewm(span=50, adjust=False)
-        .mean()
-    )
+    df["ema50"] = df["close"].ewm(
+        span=50,
+        adjust=False
+    ).mean()
 
     # RSI
-    delta = data["close"].diff()
+    delta = df["close"].diff()
 
     gain = delta.clip(lower=0)
-
     loss = -delta.clip(upper=0)
 
     avg_gain = gain.ewm(
         alpha=1 / 14,
+        min_periods=14,
         adjust=False
     ).mean()
 
     avg_loss = loss.ewm(
         alpha=1 / 14,
+        min_periods=14,
         adjust=False
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(
-        0,
-        np.nan
-    )
+    rs = avg_gain / avg_loss.replace(0, np.nan)
 
-    data["rsi"] = (
-        100
-        - (100 / (1 + rs))
-    )
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    df["rsi"] = df["rsi"].fillna(50)
 
     # MACD
-    ema12 = (
-        data["close"]
-        .ewm(span=12, adjust=False)
-        .mean()
+    ema12 = df["close"].ewm(
+        span=12,
+        adjust=False
+    ).mean()
+
+    ema26 = df["close"].ewm(
+        span=26,
+        adjust=False
+    ).mean()
+
+    df["macd"] = ema12 - ema26
+
+    df["macd_signal"] = df["macd"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
+
+    df["macd_hist"] = (
+        df["macd"] - df["macd_signal"]
     )
 
-    ema26 = (
-        data["close"]
-        .ewm(span=26, adjust=False)
-        .mean()
-    )
+    # True Range
+    previous_close = df["close"].shift(1)
 
-    data["macd"] = ema12 - ema26
-
-    data["macd_signal"] = (
-        data["macd"]
-        .ewm(span=9, adjust=False)
-        .mean()
-    )
-
-    data["macd_hist"] = (
-        data["macd"]
-        - data["macd_signal"]
-    )
-
-    # ATR
-    previous_close = data["close"].shift(1)
-
-    tr1 = (
-        data["high"]
-        - data["low"]
-    )
+    tr1 = df["high"] - df["low"]
 
     tr2 = (
-        data["high"]
-        - previous_close
+        df["high"] - previous_close
     ).abs()
 
     tr3 = (
-        data["low"]
-        - previous_close
+        df["low"] - previous_close
     ).abs()
 
-    true_range = pd.concat(
+    df["tr"] = pd.concat(
         [tr1, tr2, tr3],
         axis=1
     ).max(axis=1)
 
-    data["atr"] = (
-        true_range
-        .ewm(span=14, adjust=False)
-        .mean()
-    )
+    df["atr"] = df["tr"].rolling(14).mean()
 
     # Momentum
-    data["momentum5"] = (
-        data["close"]
-        - data["close"].shift(5)
+    df["momentum5"] = (
+        df["close"] - df["close"].shift(5)
     )
 
-    data["momentum10"] = (
-        data["close"]
-        - data["close"].shift(10)
+    df["momentum10"] = (
+        df["close"] - df["close"].shift(10)
     )
 
     # Candle
-    data["body"] = (
-        data["close"]
-        - data["open"]
+    df["body"] = (
+        df["close"] - df["open"]
     )
 
-    data["range"] = (
-        data["high"]
-        - data["low"]
+    df["range"] = (
+        df["high"] - df["low"]
     )
 
-    data["body_ratio"] = (
-        data["body"].abs()
-        / data["range"].replace(
-            0,
-            np.nan
-        )
+    df["body_ratio"] = (
+        df["body"].abs() /
+        df["range"].replace(0, np.nan)
     )
 
-    # Support / resistance
-    data["recent_high"] = (
-        data["high"]
+    df["body_ratio"] = (
+        df["body_ratio"]
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0)
+    )
+
+    # Recent support/resistance
+    df["recent_high"] = (
+        df["high"]
         .rolling(20)
         .max()
         .shift(1)
     )
 
-    data["recent_low"] = (
-        data["low"]
+    df["recent_low"] = (
+        df["low"]
         .rolling(20)
         .min()
         .shift(1)
     )
 
     # Structure
-    data["high_change"] = (
-        data["high"]
-        - data["high"].shift(5)
+    df["high_change"] = (
+        df["high"] - df["high"].shift(5)
     )
 
-    data["low_change"] = (
-        data["low"]
-        - data["low"].shift(5)
+    df["low_change"] = (
+        df["low"] - df["low"].shift(5)
     )
 
-    # Volatility
-    data["atr_average"] = (
-        data["atr"]
-        .rolling(30)
-        .mean()
-    )
-
-    return data
+    return df
 
 
 # =========================================================
 # MARKET REGIME
 # =========================================================
 
-def market_regime(row):
+def market_regime(df):
 
-    if pd.isna(row["atr"]) or row["atr"] == 0:
-        return "WARMING UP"
+    last = df.iloc[-1]
 
-    ema_distance = abs(
-        row["ema21"]
-        - row["ema50"]
+    atr = float(last["atr"]) if pd.notna(last["atr"]) else 0
+    avg_atr = (
+        df["atr"].rolling(50).mean().iloc[-1]
+        if len(df) >= 50
+        else atr
     )
 
-    trend_strength = (
-        ema_distance
-        / row["atr"]
+    if pd.isna(avg_atr):
+        avg_atr = atr
+
+    ema_gap = abs(
+        last["ema21"] - last["ema50"]
     )
 
-    if trend_strength >= 1.20:
+    if atr > avg_atr * 1.8:
+        return "HIGH VOLATILITY"
 
-        if row["ema21"] > row["ema50"]:
-            return "BULL TREND"
+    if (
+        last["ema21"] > last["ema50"]
+        and ema_gap > atr * 0.20
+    ):
+        return "BULL TREND"
 
+    if (
+        last["ema21"] < last["ema50"]
+        and ema_gap > atr * 0.20
+    ):
         return "BEAR TREND"
 
     if (
-        not pd.isna(row["atr_average"])
-        and row["atr"] > row["atr_average"] * 1.30
+        last["ema5"] > last["ema9"]
+        and last["ema9"] > last["ema21"]
     ):
-        return "HIGH VOLATILITY"
+        return "BULL MOMENTUM"
+
+    if (
+        last["ema5"] < last["ema9"]
+        and last["ema9"] < last["ema21"]
+    ):
+        return "BEAR MOMENTUM"
 
     return "SIDEWAYS"
 
@@ -370,453 +336,284 @@ def market_regime(row):
 # SIGNAL ENGINE
 # =========================================================
 
-def calculate_signal(data):
+def generate_signal(df):
 
-    if len(data) < 80:
-        return None
+    last = df.iloc[-1]
 
-    row = data.iloc[-1]
+    up_score = 0.0
+    down_score = 0.0
 
-    fields = [
-        "ema5",
-        "ema9",
-        "ema21",
-        "ema50",
-        "rsi",
-        "macd",
-        "macd_signal",
-        "macd_hist",
-        "atr",
-        "momentum5",
-        "momentum10",
-        "body_ratio"
-    ]
-
-    for field in fields:
-
-        if pd.isna(row[field]):
-            return None
-
-    up = 0.0
-    down = 0.0
-
-    up_reasons = []
-    down_reasons = []
-
-    regime = market_regime(row)
+    reasons_up = []
+    reasons_down = []
 
     # -----------------------------------------------------
-    # 1. EMA TREND
+    # EMA TREND
     # -----------------------------------------------------
 
     if (
-        row["ema5"] > row["ema9"]
-        and row["ema9"] > row["ema21"]
-        and row["ema21"] > row["ema50"]
+        last["ema5"] >
+        last["ema9"] >
+        last["ema21"] >
+        last["ema50"]
     ):
-
-        up += 2.5
-
-        up_reasons.append(
-            "EMA alignment bullish"
-        )
+        up_score += 2.0
+        reasons_up.append("EMA alignment bullish")
 
     elif (
-        row["ema5"] < row["ema9"]
-        and row["ema9"] < row["ema21"]
-        and row["ema21"] < row["ema50"]
+        last["ema5"] <
+        last["ema9"] <
+        last["ema21"] <
+        last["ema50"]
     ):
-
-        down += 2.5
-
-        down_reasons.append(
-            "EMA alignment bearish"
-        )
+        down_score += 2.0
+        reasons_down.append("EMA alignment bearish")
 
     else:
 
-        if row["ema5"] > row["ema21"]:
-
-            up += 0.75
-
-            up_reasons.append(
-                "Short EMA above EMA21"
-            )
+        if last["ema5"] > last["ema9"]:
+            up_score += 0.5
 
         else:
-
-            down += 0.75
-
-            down_reasons.append(
-                "Short EMA below EMA21"
-            )
+            down_score += 0.5
 
     # -----------------------------------------------------
-    # 2. RSI
+    # RSI
     # -----------------------------------------------------
 
-    if 52 <= row["rsi"] <= 68:
+    rsi = float(last["rsi"])
 
-        up += 1.5
+    if 50 < rsi < 70:
+        up_score += 1.0
+        reasons_up.append("RSI bullish zone")
 
-        up_reasons.append(
-            "RSI bullish zone"
-        )
+    elif 30 < rsi < 50:
+        down_score += 1.0
+        reasons_down.append("RSI bearish zone")
 
-    elif 32 <= row["rsi"] < 48:
+    elif rsi >= 70:
+        down_score += 0.5
+        reasons_down.append("RSI overbought")
 
-        down += 1.5
-
-        down_reasons.append(
-            "RSI bearish zone"
-        )
-
-    elif row["rsi"] > 68:
-
-        down += 0.5
-
-        down_reasons.append(
-            "RSI extended high"
-        )
-
-    elif row["rsi"] < 32:
-
-        up += 0.5
-
-        up_reasons.append(
-            "RSI extended low"
-        )
+    elif rsi <= 30:
+        up_score += 0.5
+        reasons_up.append("RSI oversold")
 
     # -----------------------------------------------------
-    # 3. MACD
+    # MACD
     # -----------------------------------------------------
 
     if (
-        row["macd"] > row["macd_signal"]
-        and row["macd_hist"] > 0
+        last["macd"] >
+        last["macd_signal"]
+        and last["macd_hist"] > 0
     ):
-
-        up += 2.0
-
-        up_reasons.append(
-            "MACD bullish"
-        )
+        up_score += 1.5
+        reasons_up.append("MACD bullish")
 
     elif (
-        row["macd"] < row["macd_signal"]
-        and row["macd_hist"] < 0
+        last["macd"] <
+        last["macd_signal"]
+        and last["macd_hist"] < 0
     ):
-
-        down += 2.0
-
-        down_reasons.append(
-            "MACD bearish"
-        )
+        down_score += 1.5
+        reasons_down.append("MACD bearish")
 
     # -----------------------------------------------------
-    # 4. MOMENTUM
+    # MOMENTUM
     # -----------------------------------------------------
 
     if (
-        row["momentum5"] > 0
-        and row["momentum10"] > 0
+        last["momentum5"] > 0
+        and last["momentum10"] > 0
     ):
-
-        up += 1.5
-
-        up_reasons.append(
-            "Momentum bullish"
-        )
+        up_score += 1.0
+        reasons_up.append("Momentum bullish")
 
     elif (
-        row["momentum5"] < 0
-        and row["momentum10"] < 0
+        last["momentum5"] < 0
+        and last["momentum10"] < 0
     ):
-
-        down += 1.5
-
-        down_reasons.append(
-            "Momentum bearish"
-        )
+        down_score += 1.0
+        reasons_down.append("Momentum bearish")
 
     # -----------------------------------------------------
-    # 5. CANDLE STRENGTH
+    # CANDLE STRENGTH
     # -----------------------------------------------------
 
-    if row["body_ratio"] >= 0.55:
+    body_ratio = float(last["body_ratio"])
 
-        if row["body"] > 0:
+    if body_ratio >= 0.55:
 
-            up += 1.0
+        if last["body"] > 0:
+            up_score += 0.75
+            reasons_up.append("Strong bullish candle")
 
-            up_reasons.append(
-                "Strong bullish candle"
-            )
-
-        elif row["body"] < 0:
-
-            down += 1.0
-
-            down_reasons.append(
-                "Strong bearish candle"
-            )
+        elif last["body"] < 0:
+            down_score += 0.75
+            reasons_down.append("Strong bearish candle")
 
     # -----------------------------------------------------
-    # 6. BREAKOUT
+    # BREAKOUT
     # -----------------------------------------------------
 
-    if not pd.isna(row["recent_high"]):
+    if pd.notna(last["recent_high"]):
 
-        if row["close"] > row["recent_high"]:
+        if last["close"] > last["recent_high"]:
+            up_score += 1.25
+            reasons_up.append("Resistance breakout")
 
-            up += 2.0
+    if pd.notna(last["recent_low"]):
 
-            up_reasons.append(
-                "Resistance breakout"
-            )
-
-        elif row["close"] < row["recent_low"]:
-
-            down += 2.0
-
-            down_reasons.append(
-                "Support breakdown"
-            )
+        if last["close"] < last["recent_low"]:
+            down_score += 1.25
+            reasons_down.append("Support breakdown")
 
     # -----------------------------------------------------
-    # 7. PRICE STRUCTURE
+    # PRICE STRUCTURE
     # -----------------------------------------------------
 
     if (
-        row["high_change"] > 0
-        and row["low_change"] > 0
+        last["high_change"] > 0
+        and last["low_change"] > 0
     ):
-
-        up += 1.0
-
-        up_reasons.append(
-            "Higher-high / higher-low structure"
-        )
+        up_score += 1.0
+        reasons_up.append("Higher high / higher low")
 
     elif (
-        row["high_change"] < 0
-        and row["low_change"] < 0
+        last["high_change"] < 0
+        and last["low_change"] < 0
     ):
-
-        down += 1.0
-
-        down_reasons.append(
-            "Lower-high / lower-low structure"
-        )
+        down_score += 1.0
+        reasons_down.append("Lower high / lower low")
 
     # -----------------------------------------------------
-    # 8. MARKET REGIME ADAPTATION
+    # REGIME
     # -----------------------------------------------------
 
-    if regime == "BULL TREND":
+    regime = market_regime(df)
 
-        if up >= down:
+    if regime in [
+        "BULL TREND",
+        "BULL MOMENTUM"
+    ]:
+        up_score += 0.75
+        reasons_up.append("Bullish market regime")
 
-            up += 1.5
-
-            up_reasons.append(
-                "Bull trend confirmation"
-            )
-
-        else:
-
-            down += 0.5
-
-    elif regime == "BEAR TREND":
-
-        if down >= up:
-
-            down += 1.5
-
-            down_reasons.append(
-                "Bear trend confirmation"
-            )
-
-        else:
-
-            up += 0.5
-
-    elif regime == "SIDEWAYS":
-
-        # In sideways markets, breakout/momentum
-        # evidence gets more weight than trend.
-
-        if row["momentum5"] > 0:
-
-            up += 0.5
-
-        elif row["momentum5"] < 0:
-
-            down += 0.5
+    elif regime in [
+        "BEAR TREND",
+        "BEAR MOMENTUM"
+    ]:
+        down_score += 0.75
+        reasons_down.append("Bearish market regime")
 
     # -----------------------------------------------------
     # FINAL DIRECTION
     # -----------------------------------------------------
 
-    if up >= down:
-
+    if up_score >= down_score:
         direction = "UP"
-
-        winning_score = up
-
-        losing_score = down
-
-        reasons = up_reasons
-
     else:
-
         direction = "DOWN"
 
-        winning_score = down
+    total = up_score + down_score
 
-        losing_score = up
-
-        reasons = down_reasons
-
-    total = up + down
-
-    if total <= 0:
-
-        agreement = 50
-
-    else:
-
-        agreement = (
-            winning_score
-            / total
+    if total > 0:
+        strength = (
+            max(up_score, down_score) /
+            total
         ) * 100
+    else:
+        strength = 50
 
-    strength = int(
-        min(
-            99,
-            max(
-                50,
-                agreement
-            )
-        )
+    strength = max(
+        50,
+        min(95, strength)
     )
 
     return {
         "direction": direction,
-        "strength": strength,
-        "up_score": round(up, 2),
-        "down_score": round(down, 2),
+        "up_score": round(up_score, 2),
+        "down_score": round(down_score, 2),
+        "strength": round(strength, 1),
         "regime": regime,
-        "price": float(row["close"]),
-        "rsi": float(row["rsi"]),
-        "macd": float(row["macd"]),
-        "atr": float(row["atr"]),
-        "reasons": reasons
+        "reasons_up": reasons_up,
+        "reasons_down": reasons_down
     }
 
 
 # =========================================================
-# MULTI-TIMEFRAME CONFIRMATION
+# MTF ANALYSIS
 # =========================================================
 
-def timeframe_signal(symbol, interval):
-
-    df, error = get_data(
-        symbol,
-        interval,
-        250
-    )
-
-    if df.empty:
-        return None
-
-    df = add_indicators(df)
-
-    return calculate_signal(df)
-
-
-def get_multi_timeframe(symbol, main_interval):
-
-    results = {}
+def get_mtf_signal(symbol):
 
     intervals = [
-        "1min",
-        "5min",
-        "15min"
+        ("1min", "1 Minute"),
+        ("5min", "5 Minutes"),
+        ("15min", "15 Minutes")
     ]
 
-    for interval in intervals:
+    results = []
 
-        if interval == main_interval:
+    for interval, label in intervals:
 
-            continue
-
-        result = timeframe_signal(
+        df, error = get_data(
             symbol,
-            interval
+            interval,
+            250
         )
 
-        if result is not None:
+        if df is None:
+            results.append({
+                "Timeframe": label,
+                "Direction": "ERROR",
+                "Strength": 0
+            })
+            continue
 
-            results[interval] = result
+        df = calculate_indicators(df)
 
-    return results
+        signal = generate_signal(df)
+
+        results.append({
+            "Timeframe": label,
+            "Direction": signal["direction"],
+            "Strength": signal["strength"]
+        })
+
+    return pd.DataFrame(results)
 
 
 # =========================================================
-# WALK FORWARD BACKTEST
+# BACKTEST
 # =========================================================
 
-def walk_forward_test(data):
+def run_backtest(df):
 
-    if len(data) < 160:
-
-        return {
-            "wins": 0,
-            "losses": 0,
-            "accuracy": 0.0,
-            "total": 0
-        }
+    if len(df) < 120:
+        return None
 
     wins = 0
     losses = 0
 
     start = 100
-
-    end = len(data) - 1
+    end = len(df) - 1
 
     for i in range(start, end):
 
-        training_data = data.iloc[:i].copy()
+        sample = df.iloc[:i].copy()
 
-        signal = calculate_signal(
-            training_data
-        )
+        signal = generate_signal(sample)
 
-        if signal is None:
-            continue
+        direction = signal["direction"]
 
-        current_close = float(
-            data.iloc[i]["close"]
-        )
+        current_close = df.iloc[i]["close"]
+        next_close = df.iloc[i + 1]["close"]
 
-        next_close = float(
-            data.iloc[i + 1]["close"]
-        )
-
-        if signal["direction"] == "UP":
-
-            correct = (
-                next_close
-                > current_close
-            )
-
+        if direction == "UP":
+            correct = next_close > current_close
         else:
-
-            correct = (
-                next_close
-                < current_close
-            )
+            correct = next_close < current_close
 
         if correct:
             wins += 1
@@ -826,333 +623,346 @@ def walk_forward_test(data):
     total = wins + losses
 
     if total == 0:
+        return None
 
-        accuracy = 0.0
-
-    else:
-
-        accuracy = (
-            wins / total
-        ) * 100
+    accuracy = (
+        wins / total
+    ) * 100
 
     return {
         "wins": wins,
         "losses": losses,
-        "accuracy": accuracy,
-        "total": total
+        "total": total,
+        "accuracy": accuracy
     }
-
-
-# =========================================================
-# HISTORICAL SIGNAL TEST
-# =========================================================
-
-def historical_test(data):
-
-    if len(data) < 120:
-
-        return {
-            "wins": 0,
-            "losses": 0,
-            "accuracy": 0.0,
-            "total": 0
-        }
-
-    wins = 0
-    losses = 0
-
-    start = 80
-
-    for i in range(
-        start,
-        len(data) - 1
-    ):
-
-        sample = data.iloc[:i + 1]
-
-        signal = calculate_signal(
-            sample
-        )
-
-        if signal is None:
-            continue
-
-        current_close = float(
-            data.iloc[i]["close"]
-        )
-
-        next_close = float(
-            data.iloc[i + 1]["close"]
-        )
-
-        if signal["direction"] == "UP":
-
-            if next_close > current_close:
-                wins += 1
-            else:
-                losses += 1
-
-        else:
-
-            if next_close < current_close:
-                wins += 1
-            else:
-                losses += 1
-
-    total = wins + losses
-
-    if total:
-
-        accuracy = (
-            wins / total
-        ) * 100
-
-    else:
-
-        accuracy = 0.0
-
-    return {
-        "wins": wins,
-        "losses": losses,
-        "accuracy": accuracy,
-        "total": total
-    }
-
-
-# =========================================================
-# MAIN DATA
-# =========================================================
-
-if not API_KEY:
-
-    st.error(
-        "TWELVE_DATA_API_KEY Streamlit Secrets mein nahi mili."
-    )
-
-    st.stop()
-
-
-with st.spinner(
-    "Market data analyze ho raha hai..."
-):
-
-    main_df, error = get_data(
-        pair,
-        timeframe,
-        lookback
-    )
-
-
-if main_df.empty:
-
-    st.error(
-        "Market data nahi mili."
-    )
-
-    st.code(error)
-
-    st.stop()
-
-
-main_df = add_indicators(
-    main_df
-)
-
-
-# =========================================================
-# CURRENT MARKET
-# =========================================================
-
-signal = calculate_signal(
-    main_df
-)
-
-if signal is None:
-
-    st.warning(
-        "Indicators calculate karne ke liye "
-        "aur candles chahiye."
-    )
-
-    st.stop()
 
 
 # =========================================================
 # HEADER
 # =========================================================
 
-st.subheader(
-    pair
-    + " — "
-    + timeframe_name
+st.title("📊 Live Trading Signal System")
+
+st.caption(
+    "Real-time market analysis • UP/DOWN direction • "
+    "Multi-strategy confirmation"
 )
 
-c1, c2, c3, c4 = st.columns(4)
 
-with c1:
+# =========================================================
+# CONTROL PANEL
+# =========================================================
 
-    st.metric(
-        "Live Price",
-        f"{signal['price']:.6f}"
+st.subheader("🎛️ Trading Controls")
+
+col1, col2, col3 = st.columns([1.3, 1.3, 1])
+
+with col1:
+
+    selected_pair = st.selectbox(
+        "Currency Pair",
+        PAIRS,
+        index=PAIRS.index(
+            st.session_state.pair
+        )
     )
 
-with c2:
+with col2:
 
-    st.metric(
-        "Direction",
-        signal["direction"]
+    timeframe_names = list(TIMEFRAMES.keys())
+
+    selected_name = st.selectbox(
+        "Timeframe",
+        timeframe_names,
+        index=timeframe_names.index(
+            next(
+                name
+                for name, value
+                in TIMEFRAMES.items()
+                if value == st.session_state.timeframe
+            )
+        )
     )
 
-with c3:
+with col3:
 
-    st.metric(
-        "Signal Strength",
-        str(signal["strength"])
-        + "%"
+    candles = st.number_input(
+        "Historical Candles",
+        min_value=200,
+        max_value=1000,
+        value=500,
+        step=100
     )
 
-with c4:
 
-    st.metric(
-        "Market Regime",
-        signal["regime"]
-    )
+st.session_state.pair = selected_pair
+st.session_state.timeframe = TIMEFRAMES[selected_name]
 
 
 # =========================================================
-# BIG SIGNAL
+# CLICKABLE TIMEFRAME BUTTONS
 # =========================================================
 
-st.subheader(
-    "🎯 Current Trading Direction"
+st.write("### ⏱️ Quick Timeframe")
+
+tf1, tf2, tf3, tf4, tf5 = st.columns(5)
+
+if tf1.button(
+    "1 MIN",
+    use_container_width=True
+):
+    st.session_state.timeframe = "1min"
+    st.rerun()
+
+if tf2.button(
+    "5 MIN",
+    use_container_width=True
+):
+    st.session_state.timeframe = "5min"
+    st.rerun()
+
+if tf3.button(
+    "15 MIN",
+    use_container_width=True
+):
+    st.session_state.timeframe = "15min"
+    st.rerun()
+
+if tf4.button(
+    "30 MIN",
+    use_container_width=True
+):
+    st.session_state.timeframe = "30min"
+    st.rerun()
+
+if tf5.button(
+    "1 HOUR",
+    use_container_width=True
+):
+    st.session_state.timeframe = "1h"
+    st.rerun()
+
+
+# =========================================================
+# MAIN BUTTONS
+# =========================================================
+
+b1, b2, b3 = st.columns(3)
+
+analyze_clicked = b1.button(
+    "🔄 Analyze Market",
+    use_container_width=True,
+    type="primary"
 )
 
-if signal["direction"] == "UP":
-
-    st.success(
-        "🟢 UP"
-    )
-
-else:
-
-    st.error(
-        "🔴 DOWN"
-    )
-
-
-# =========================================================
-# INDICATORS
-# =========================================================
-
-st.subheader(
-    "📊 Technical Analysis"
+signal_clicked = b2.button(
+    "🎯 Generate New Signal",
+    use_container_width=True
 )
 
-a, b, c, d, e = st.columns(5)
-
-with a:
-
-    st.metric(
-        "RSI",
-        f"{signal['rsi']:.2f}"
-    )
-
-with b:
-
-    st.metric(
-        "MACD",
-        f"{signal['macd']:.6f}"
-    )
-
-with c:
-
-    st.metric(
-        "ATR",
-        f"{signal['atr']:.6f}"
-    )
-
-with d:
-
-    st.metric(
-        "UP Score",
-        str(signal["up_score"])
-    )
-
-with e:
-
-    st.metric(
-        "DOWN Score",
-        str(signal["down_score"])
-    )
-
-
-# =========================================================
-# REASONS
-# =========================================================
-
-st.subheader(
-    "🧠 Signal Reasons"
+clear_clicked = b3.button(
+    "🗑️ Clear",
+    use_container_width=True
 )
 
-for reason in signal["reasons"]:
 
-    st.write(
-        "•",
-        reason
-    )
+if clear_clicked:
+
+    st.session_state.data = None
+    st.session_state.signal = None
+    st.session_state.signal_price = None
+    st.session_state.signal_time = None
+
+    st.rerun()
 
 
 # =========================================================
-# MULTI TIMEFRAME
+# FETCH MAIN DATA
 # =========================================================
 
-st.subheader(
-    "🔄 Multi-Timeframe Confirmation"
-)
-
-with st.spinner(
-    "Higher/lower timeframe confirmation..."
+if (
+    analyze_clicked
+    or signal_clicked
+    or st.session_state.data is None
 ):
 
-    mtf = get_multi_timeframe(
-        pair,
-        timeframe
-    )
+    with st.spinner("Market data analyze ho raha hai..."):
 
-if mtf:
-
-    mtf_rows = []
-
-    for interval, result in mtf.items():
-
-        mtf_rows.append(
-            {
-                "Timeframe": interval,
-                "Direction": result["direction"],
-                "Strength": str(
-                    result["strength"]
-                ) + "%",
-                "Regime": result["regime"]
-            }
+        df, error = get_data(
+            st.session_state.pair,
+            st.session_state.timeframe,
+            int(candles)
         )
 
-    mtf_df = pd.DataFrame(
-        mtf_rows
-    )
+    if error:
 
-    st.dataframe(
-        mtf_df,
-        use_container_width=True,
-        hide_index=True
-    )
+        st.error(
+            "Market data error: " + str(error)
+        )
 
-else:
+    else:
 
-    st.info(
-        "Multi-timeframe data available nahi."
-    )
+        df = calculate_indicators(df)
+
+        st.session_state.data = df
+
+        signal = generate_signal(df)
+
+        st.session_state.signal = signal
 
 
 # =========================================================
-# HISTORICAL BACKTEST
-# =========
+# DISPLAY SIGNAL
+# =========================================================
+
+if st.session_state.data is not None:
+
+    df = st.session_state.data
+    signal = st.session_state.signal
+
+    last = df.iloc[-1]
+
+    price = float(last["close"])
+
+    direction = signal["direction"]
+
+    strength = signal["strength"]
+
+    regime = signal["regime"]
+
+
+    st.divider()
+
+    st.subheader(
+        f"📈 {st.session_state.pair} — "
+        f"{selected_name}"
+    )
+
+
+    # -----------------------------------------------------
+    # TOP METRICS
+    # -----------------------------------------------------
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Latest Price",
+        f"{price:.6f}"
+    )
+
+    c2.metric(
+        "Direction",
+        direction
+    )
+
+    c3.metric(
+        "Signal Strength",
+        f"{strength:.1f}%"
+    )
+
+    c4.metric(
+        "Market Regime",
+        regime
+    )
+
+
+    # -----------------------------------------------------
+    # BIG SIGNAL
+    # -----------------------------------------------------
+
+    st.subheader(
+        "🎯 Current Trading Direction"
+    )
+
+    if direction == "UP":
+
+        st.success(
+            "🟢 UP\n\n"
+            f"Signal Strength: {strength:.1f}%"
+        )
+
+    else:
+
+        st.error(
+            "🔴 DOWN\n\n"
+            f"Signal Strength: {strength:.1f}%"
+        )
+
+
+    st.caption(
+        "Signal Strength indicator agreement score hai, "
+        "guaranteed win probability nahi."
+    )
+
+
+    # -----------------------------------------------------
+    # GENERATE SIGNAL RECORD
+    # -----------------------------------------------------
+
+    if signal_clicked:
+
+        st.session_state.signal_price = price
+
+        st.session_state.signal_time = (
+            datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        )
+
+        st.session_state.history.append({
+            "Time": st.session_state.signal_time,
+            "Pair": st.session_state.pair,
+            "Timeframe": selected_name,
+            "Price": price,
+            "Direction": direction,
+            "Strength": strength
+        })
+
+        st.success(
+            f"New {direction} signal generated at "
+            f"{price:.6f}"
+        )
+
+
+    # -----------------------------------------------------
+    # TECHNICAL ANALYSIS
+    # -----------------------------------------------------
+
+    with st.expander(
+        "📊 Technical Analysis",
+        expanded=True
+    ):
+
+        a1, a2, a3, a4 = st.columns(4)
+
+        a1.metric(
+            "RSI",
+            f"{last['rsi']:.2f}"
+        )
+
+        a2.metric(
+            "MACD",
+            f"{last['macd']:.6f}"
+        )
+
+        a3.metric(
+            "ATR",
+            f"{last['atr']:.6f}"
+        )
+
+        a4.metric(
+            "Momentum",
+            f"{last['momentum5']:.6f}"
+        )
+
+
+        st.write(
+            f"**UP Score:** {signal['up_score']}"
+        )
+
+        st.write(
+            f"**DOWN Score:** {signal['down_score']}"
+        )
+
+
+    # ----------------------------
