@@ -7,6 +7,7 @@ import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from collections import defaultdict, deque
 
 # =========================================================
 # PAGE
@@ -19,7 +20,7 @@ st.set_page_config(
 )
 
 # =========================================================
-# API
+# SETTINGS
 # =========================================================
 
 API_KEY = st.secrets.get("TWELVE_DATA_API_KEY", "")
@@ -43,68 +44,82 @@ TIMEFRAMES = {
 }
 
 # =========================================================
-# SESSION STATE
+# GLOBAL WEBSOCKET STORAGE
+# =========================================================
+# Important:
+# WebSocket data yahan store hota hai, Streamlit session_state
+# mein nahi. Isse rerun par tick buffer normally disappear nahi
+# hota.
+
+if "GLOBAL_TICKS" not in st.session_state:
+    st.session_state.GLOBAL_TICKS = {}
+
+if "WS_THREADS" not in st.session_state:
+    st.session_state.WS_THREADS = {}
+
+if "WS_STATUS" not in st.session_state:
+    st.session_state.WS_STATUS = {}
+
+if "PENDING" not in st.session_state:
+    st.session_state.PENDING = None
+
+if "RESULTS" not in st.session_state:
+    st.session_state.RESULTS = []
+
+
+# =========================================================
+# INITIALIZE SYMBOL BUFFER
 # =========================================================
 
-if "ticks" not in st.session_state:
-    st.session_state.ticks = {}
+def init_symbol(symbol):
 
-if "ws_status" not in st.session_state:
-    st.session_state.ws_status = "Disconnected"
-
-if "ws_started" not in st.session_state:
-    st.session_state.ws_started = False
-
-if "pending_signal" not in st.session_state:
-    st.session_state.pending_signal = None
-
-if "live_results" not in st.session_state:
-    st.session_state.live_results = []
+    if symbol not in st.session_state.GLOBAL_TICKS:
+        st.session_state.GLOBAL_TICKS[symbol] = deque(
+            maxlen=10000
+        )
 
 
 # =========================================================
-# WEBSOCKET STORAGE
+# SAVE TICK
 # =========================================================
 
-def store_tick(symbol, price):
+def save_tick(symbol, price):
 
-    if symbol not in st.session_state.ticks:
-        st.session_state.ticks[symbol] = []
+    init_symbol(symbol)
 
-    st.session_state.ticks[symbol].append({
-        "time": datetime.now(),
-        "price": float(price)
-    })
-
-    # Keep latest 5000 ticks
-    st.session_state.ticks[symbol] = (
-        st.session_state.ticks[symbol][-5000:]
+    st.session_state.GLOBAL_TICKS[symbol].append(
+        {
+            "time": datetime.now(),
+            "price": float(price)
+        }
     )
 
 
 # =========================================================
-# WEBSOCKET CALLBACKS
+# WEBSOCKET
 # =========================================================
 
-def websocket_worker(symbol):
+def websocket_loop(symbol):
 
-    ws_url = (
+    url = (
         "wss://ws.twelvedata.com/v1/quotes/price"
         "?apikey=" + API_KEY
     )
 
     def on_open(ws):
 
-        st.session_state.ws_status = "Connected"
+        st.session_state.WS_STATUS[symbol] = "CONNECTED"
 
-        message = {
+        subscribe = {
             "action": "subscribe",
             "params": {
                 "symbols": symbol
             }
         }
 
-        ws.send(json.dumps(message))
+        ws.send(
+            json.dumps(subscribe)
+        )
 
     def on_message(ws, message):
 
@@ -112,13 +127,15 @@ def websocket_worker(symbol):
 
             data = json.loads(message)
 
-            if data.get("event") == "price":
+            event = data.get("event")
+
+            if event == "price":
 
                 price = data.get("price")
 
                 if price is not None:
 
-                    store_tick(
+                    save_tick(
                         symbol,
                         float(price)
                     )
@@ -128,21 +145,48 @@ def websocket_worker(symbol):
 
     def on_error(ws, error):
 
-        st.session_state.ws_status = "Error"
+        st.session_state.WS_STATUS[
+            symbol
+        ] = "ERROR"
 
-    def on_close(ws, close_status_code, close_msg):
+    def on_close(
+        ws,
+        close_status_code,
+        close_msg
+    ):
 
-        st.session_state.ws_status = "Disconnected"
+        st.session_state.WS_STATUS[
+            symbol
+        ] = "DISCONNECTED"
 
-    ws = websocket.WebSocketApp(
-        ws_url,
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
-    )
+    while True:
 
-    ws.run_forever()
+        try:
+
+            st.session_state.WS_STATUS[
+                symbol
+            ] = "CONNECTING"
+
+            ws = websocket.WebSocketApp(
+                url,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10
+            )
+
+        except Exception:
+
+            st.session_state.WS_STATUS[
+                symbol
+            ] = "RECONNECTING"
+
+        time.sleep(3)
 
 
 # =========================================================
@@ -151,32 +195,42 @@ def websocket_worker(symbol):
 
 def start_websocket(symbol):
 
-    if st.session_state.ws_started:
-        return
+    init_symbol(symbol)
 
-    st.session_state.ws_started = True
+    if symbol in st.session_state.WS_THREADS:
+        thread = st.session_state.WS_THREADS[symbol]
+
+        if thread.is_alive():
+            return
 
     thread = threading.Thread(
-        target=websocket_worker,
+        target=websocket_loop,
         args=(symbol,),
         daemon=True
     )
 
     thread.start()
 
+    st.session_state.WS_THREADS[
+        symbol
+    ] = thread
+
 
 # =========================================================
-# BUILD LOCAL CANDLES
+# LOCAL CANDLES FROM WEBSOCKET TICKS
 # =========================================================
 
-def build_candles(symbol, seconds):
+def make_local_candles(symbol, seconds):
 
-    if symbol not in st.session_state.ticks:
-        return pd.DataFrame()
+    init_symbol(symbol)
 
-    ticks = st.session_state.ticks[symbol]
+    ticks = list(
+        st.session_state.GLOBAL_TICKS[
+            symbol
+        ]
+    )
 
-    if len(ticks) < 10:
+    if len(ticks) < 5:
         return pd.DataFrame()
 
     df = pd.DataFrame(ticks)
@@ -185,16 +239,28 @@ def build_candles(symbol, seconds):
         df["time"]
     )
 
+    df["price"] = pd.to_numeric(
+        df["price"],
+        errors="coerce"
+    )
+
+    df = df.dropna()
+
+    if df.empty:
+        return pd.DataFrame()
+
     df = df.set_index("time")
 
     candles = df["price"].resample(
         f"{seconds}s"
-    ).agg([
-        "first",
-        "max",
-        "min",
-        "last"
-    ])
+    ).agg(
+        [
+            "first",
+            "max",
+            "min",
+            "last"
+        ]
+    )
 
     candles.columns = [
         "open",
@@ -211,7 +277,7 @@ def build_candles(symbol, seconds):
 
 
 # =========================================================
-# HISTORICAL DATA
+# HISTORICAL 1-MINUTE DATA
 # =========================================================
 
 def get_historical(symbol):
@@ -248,15 +314,15 @@ def get_historical(symbol):
             df["datetime"]
         )
 
-        for c in [
+        for col in [
             "open",
             "high",
             "low",
             "close"
         ]:
 
-            df[c] = pd.to_numeric(
-                df[c],
+            df[col] = pd.to_numeric(
+                df[col],
                 errors="coerce"
             )
 
@@ -279,11 +345,10 @@ def get_historical(symbol):
 # INDICATORS
 # =========================================================
 
-def indicators(df):
+def calculate_indicators(df):
 
     df = df.copy()
 
-    # EMA
     df["ema5"] = df["close"].ewm(
         span=5,
         adjust=False
@@ -305,6 +370,7 @@ def indicators(df):
     ).mean()
 
     # RSI
+
     delta = df["close"].diff()
 
     gain = delta.clip(
@@ -324,22 +390,23 @@ def indicators(df):
     ).mean()
 
     rs = (
-        avg_gain
-        / avg_loss.replace(
+        avg_gain /
+        avg_loss.replace(
             0,
             np.nan
         )
     )
 
     df["rsi"] = (
-        100
-        - (
-            100
-            / (1 + rs)
+        100 -
+        (
+            100 /
+            (1 + rs)
         )
     )
 
     # MACD
+
     ema12 = df["close"].ewm(
         span=12,
         adjust=False
@@ -355,12 +422,10 @@ def indicators(df):
     )
 
     df["macd_signal"] = (
-        df["macd"]
-        .ewm(
+        df["macd"].ewm(
             span=9,
             adjust=False
-        )
-        .mean()
+        ).mean()
     )
 
     df["macd_hist"] = (
@@ -369,6 +434,7 @@ def indicators(df):
     )
 
     # ATR
+
     tr1 = (
         df["high"]
         - df["low"]
@@ -398,6 +464,7 @@ def indicators(df):
     ).mean()
 
     # Candle
+
     df["body"] = abs(
         df["close"]
         - df["open"]
@@ -410,16 +477,34 @@ def indicators(df):
 
     df["body_ratio"] = (
         df["body"]
-        / df["range"].replace(
+        /
+        df["range"].replace(
             0,
             np.nan
         )
     )
 
     # Momentum
+
     df["momentum"] = (
         df["close"]
         .pct_change(3)
+    )
+
+    # Recent structure
+
+    df["recent_high"] = (
+        df["high"]
+        .rolling(10)
+        .max()
+        .shift(1)
+    )
+
+    df["recent_low"] = (
+        df["low"]
+        .rolling(10)
+        .min()
+        .shift(1)
     )
 
     return df
@@ -429,24 +514,29 @@ def indicators(df):
 # MARKET REGIME
 # =========================================================
 
-def market_regime(df):
+def detect_regime(df):
 
-    if len(df) < 50:
+    if len(df) < 30:
         return "WARMING UP"
 
     last = df.iloc[-1]
 
-    ema_distance = abs(
+    if pd.isna(last["atr"]):
+        return "UNKNOWN"
+
+    ema_gap = abs(
         last["ema9"]
         - last["ema21"]
     )
 
-    volatility = last["atr"]
+    atr = last["atr"]
 
-    if pd.isna(volatility):
-        return "UNKNOWN"
+    if atr <= 0:
+        return "SIDEWAYS"
 
-    if ema_distance > volatility * 0.30:
+    ratio = ema_gap / atr
+
+    if ratio > 0.35:
 
         if last["ema9"] > last["ema21"]:
             return "BULL TREND"
@@ -457,34 +547,34 @@ def market_regime(df):
 
 
 # =========================================================
-# ADAPTIVE SIGNAL
+# MULTI STRATEGY ENGINE
 # =========================================================
 
-def adaptive_signal(df):
+def generate_signal(df):
 
-    if len(df) < 60:
+    if len(df) < 30:
 
         return (
             "UP",
-            50,
+            50.0,
             0,
             0,
             "WARMING UP",
-            ["Collecting enough candles"]
+            ["Collecting candles"]
         )
 
     last = df.iloc[-1]
 
-    regime = market_regime(df)
-
-    up = 0
-    down = 0
+    up = 0.0
+    down = 0.0
 
     up_reasons = []
     down_reasons = []
 
+    regime = detect_regime(df)
+
     # -----------------------------------------------------
-    # TREND
+    # 1. EMA TREND
     # -----------------------------------------------------
 
     if (
@@ -514,7 +604,7 @@ def adaptive_signal(df):
         )
 
     # -----------------------------------------------------
-    # RSI
+    # 2. RSI
     # -----------------------------------------------------
 
     if 52 <= last["rsi"] <= 68:
@@ -522,7 +612,7 @@ def adaptive_signal(df):
         up += 3
 
         up_reasons.append(
-            "RSI bullish"
+            "RSI bullish zone"
         )
 
     elif 32 <= last["rsi"] <= 48:
@@ -530,11 +620,27 @@ def adaptive_signal(df):
         down += 3
 
         down_reasons.append(
-            "RSI bearish"
+            "RSI bearish zone"
+        )
+
+    elif last["rsi"] < 30:
+
+        up += 2
+
+        up_reasons.append(
+            "RSI oversold"
+        )
+
+    elif last["rsi"] > 70:
+
+        down += 2
+
+        down_reasons.append(
+            "RSI overbought"
         )
 
     # -----------------------------------------------------
-    # MACD
+    # 3. MACD
     # -----------------------------------------------------
 
     if (
@@ -562,7 +668,7 @@ def adaptive_signal(df):
         )
 
     # -----------------------------------------------------
-    # MOMENTUM
+    # 4. MOMENTUM
     # -----------------------------------------------------
 
     if last["momentum"] > 0:
@@ -582,7 +688,7 @@ def adaptive_signal(df):
         )
 
     # -----------------------------------------------------
-    # CANDLE
+    # 5. CANDLE STRENGTH
     # -----------------------------------------------------
 
     if (
@@ -592,7 +698,7 @@ def adaptive_signal(df):
 
         if last["close"] > last["open"]:
 
-            up += 2
+            up += 3
 
             up_reasons.append(
                 "Strong bullish candle"
@@ -600,19 +706,73 @@ def adaptive_signal(df):
 
         elif last["close"] < last["open"]:
 
-            down += 2
+            down += 3
 
             down_reasons.append(
                 "Strong bearish candle"
             )
 
     # -----------------------------------------------------
-    # REGIME ADAPTATION
+    # 6. BREAKOUT
+    # -----------------------------------------------------
+
+    if (
+        pd.notna(last["recent_high"])
+        and last["close"]
+        > last["recent_high"]
+    ):
+
+        up += 4
+
+        up_reasons.append(
+            "Recent high breakout"
+        )
+
+    elif (
+        pd.notna(last["recent_low"])
+        and last["close"]
+        < last["recent_low"]
+    ):
+
+        down += 4
+
+        down_reasons.append(
+            "Recent low breakdown"
+        )
+
+    # -----------------------------------------------------
+    # 7. PRICE STRUCTURE
+    # -----------------------------------------------------
+
+    if len(df) >= 4:
+
+        a = df.iloc[-1]["close"]
+        b = df.iloc[-2]["close"]
+        c = df.iloc[-3]["close"]
+
+        if a > b > c:
+
+            up += 2
+
+            up_reasons.append(
+                "Higher close structure"
+            )
+
+        elif a < b < c:
+
+            down += 2
+
+            down_reasons.append(
+                "Lower close structure"
+            )
+
+    # -----------------------------------------------------
+    # 8. REGIME
     # -----------------------------------------------------
 
     if regime == "BULL TREND":
 
-        up += 2
+        up += 3
 
         up_reasons.append(
             "Bull trend regime"
@@ -620,7 +780,7 @@ def adaptive_signal(df):
 
     elif regime == "BEAR TREND":
 
-        down += 2
+        down += 3
 
         down_reasons.append(
             "Bear trend regime"
@@ -628,7 +788,8 @@ def adaptive_signal(df):
 
     elif regime == "SIDEWAYS":
 
-        # Reduce aggressive trend signals
+        # Sideways mein trend signals ko
+        # thora reduce karte hain.
         if up > down:
             up -= 1
 
@@ -636,13 +797,21 @@ def adaptive_signal(df):
             down -= 1
 
     # -----------------------------------------------------
-    # SCORE
+    # FINAL
     # -----------------------------------------------------
 
-    total = max(
-        up + down,
-        1
-    )
+    total = up + down
+
+    if total <= 0:
+
+        return (
+            "UP",
+            50.0,
+            up,
+            down,
+            regime,
+            ["No clear technical bias"]
+        )
 
     if up >= down:
 
@@ -675,7 +844,7 @@ def adaptive_signal(df):
 
 
 # =========================================================
-# PAGE
+# MAIN
 # =========================================================
 
 st.title(
@@ -683,7 +852,7 @@ st.title(
 )
 
 st.caption(
-    "WebSocket ticks + local candles + adaptive analysis"
+    "WebSocket + 5s/10s/15s/30s/1min + Multi-Strategy"
 )
 
 if not API_KEY:
@@ -695,7 +864,7 @@ if not API_KEY:
     st.stop()
 
 # =========================================================
-# CONTROLS
+# SELECT
 # =========================================================
 
 pair = st.selectbox(
@@ -718,12 +887,25 @@ seconds = TIMEFRAMES[
 
 start_websocket(pair)
 
-st.write(
-    f"WebSocket status: **{st.session_state.ws_status}**"
+status = st.session_state.WS_STATUS.get(
+    pair,
+    "STARTING"
+)
+
+tick_count = len(
+    st.session_state.GLOBAL_TICKS.get(
+        pair,
+        []
+    )
+)
+
+st.info(
+    f"📡 WebSocket: **{status}** | "
+    f"Live ticks: **{tick_count}**"
 )
 
 # =========================================================
-# ANALYZE
+# ANALYZE BUTTON
 # =========================================================
 
 if st.button(
@@ -731,39 +913,87 @@ if st.button(
     use_container_width=True
 ):
 
-    # Get live price from REST
-    price, error = get_historical(pair), None
-
-    if price is None:
-
-        st.error(
-            "Historical market data unavailable."
-        )
-
-        st.stop()
-
-    # Local candles
-    df = build_candles(
+    # Build local candles
+    local_df = make_local_candles(
         pair,
         seconds
     )
 
-    if len(df) < 60:
+    candle_count = len(local_df)
 
-        st.warning(
-            f"{timeframe} ke liye abhi "
-            f"{len(df)} candles available hain. "
-            f"Kam az kam 60 candles collect hone dein."
+    st.write(
+        f"Local {timeframe} candles: "
+        f"**{candle_count}**"
+    )
+
+    # -----------------------------------------------------
+    # 5s / 10s / 15s / 30s
+    # -----------------------------------------------------
+
+    if seconds < 60:
+
+        if candle_count >= 30:
+
+            df = local_df
+
+            st.success(
+                "✅ Real WebSocket candles available."
+            )
+
+        else:
+
+            # Warm-up from historical data.
+            # Signal will be based on 1-minute data
+            # until enough local candles arrive.
+
+            historical = get_historical(
+                pair
+            )
+
+            if historical is None:
+
+                st.error(
+                    "Market data unavailable."
+                )
+
+                st.stop()
+
+            df = historical
+
+            st.warning(
+                f"{timeframe} ke liye abhi "
+                f"{candle_count} local candles hain. "
+                f"Warm-up ke liye temporary 1-minute "
+                f"historical data use ho raha hai."
+            )
+
+    # -----------------------------------------------------
+    # 1 MINUTE
+    # -----------------------------------------------------
+
+    else:
+
+        historical = get_historical(
+            pair
         )
 
-        st.info(
-            "WebSocket live ticks background mein "
-            "collect ho rahe hain."
-        )
+        if historical is None:
 
-        st.stop()
+            st.error(
+                "Historical data unavailable."
+            )
 
-    df = indicators(df)
+            st.stop()
+
+        df = historical
+
+    # =====================================================
+    # INDICATORS
+    # =====================================================
+
+    df = calculate_indicators(
+        df
+    )
 
     (
         signal,
@@ -772,13 +1002,15 @@ if st.button(
         down_score,
         regime,
         reasons
-    ) = adaptive_signal(df)
+    ) = generate_signal(df)
 
     live_price = df.iloc[-1]["close"]
 
     # =====================================================
     # SIGNAL
     # =====================================================
+
+    st.divider()
 
     st.metric(
         "💰 LIVE PRICE",
@@ -788,22 +1020,22 @@ if st.button(
     if signal == "UP":
 
         st.success(
-            "🟢 SIGNAL: UP"
+            "🟢 TRADE DIRECTION: UP"
         )
 
     else:
 
         st.error(
-            "🔴 SIGNAL: DOWN"
+            "🔴 TRADE DIRECTION: DOWN"
         )
 
     st.metric(
-        "SIGNAL STRENGTH",
+        "📊 SIGNAL STRENGTH",
         f"{strength}%"
     )
 
     st.metric(
-        "MARKET REGIME",
+        "📈 MARKET REGIME",
         regime
     )
 
@@ -823,10 +1055,14 @@ if st.button(
             down_score
         )
 
+    # =====================================================
+    # REASONS
+    # =====================================================
+
     st.divider()
 
     st.subheader(
-        "🧠 Signal Reasons"
+        "🧠 Strategy Confirmations"
     )
 
     for reason in reasons:
@@ -834,6 +1070,10 @@ if st.button(
         st.write(
             "• " + reason
         )
+
+    # =====================================================
+    # INDICATORS
+    # =====================================================
 
     st.divider()
 
@@ -864,45 +1104,4 @@ if st.button(
     )
 
     st.write(
-        f"MACD: {last['macd']:.6f}"
-    )
-
-    st.write(
-        f"ATR: {last['atr']:.6f}"
-    )
-
-    st.divider()
-
-    st.subheader(
-        "⚠️ Important"
-    )
-
-    st.warning(
-        "5s/10s/15s/30s signals ke liye "
-        "WebSocket ko enough ticks collect karne "
-        "dene honge. Strength % guaranteed "
-        "win probability nahi hai."
-    )
-
-# =========================================================
-# LIVE TICK COUNTER
-# =========================================================
-
-tick_count = len(
-    st.session_state.ticks.get(
-        pair,
-        []
-    )
-)
-
-st.divider()
-
-st.write(
-    f"📡 Live ticks collected: **{tick_count}**"
-)
-
-st.write(
-    "WebSocket: **"
-    + st.session_state.ws_status
-    + "**"
-)
+        f"MACD: 
