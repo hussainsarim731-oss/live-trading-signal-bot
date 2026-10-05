@@ -5,336 +5,553 @@ import numpy as np
 from datetime import datetime
 
 st.set_page_config(
-page_title="Live Trading Signal Bot",
-page_icon="📊"
+    page_title="Live Trading Signal Bot",
+    page_icon="📊"
 )
 
 API_KEY = st.secrets.get("TWELVE_DATA_API_KEY", "")
 
 PAIRS = [
-"EUR/USD",
-"GBP/USD",
-"USD/JPY",
-"USD/CHF",
-"AUD/USD",
-"USD/CAD",
-"NZD/USD"
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+    "USD/CHF",
+    "AUD/USD",
+    "USD/CAD",
+    "NZD/USD"
 ]
 
 TIMEFRAMES = {
-"1 Minute": "1min",
-"5 Minutes": "5min",
-"15 Minutes": "15min"
+    "1 Minute": "1min",
+    "5 Minutes": "5min",
+    "15 Minutes": "15min"
 }
 
+
 def get_data(symbol, interval):
-url = "https://api.twelvedata.com/time_series"
+    url = "https://api.twelvedata.com/time_series"
 
-params = {  
-    "symbol": symbol,  
-    "interval": interval,  
-    "outputsize": 500,  
-    "apikey": API_KEY  
-}  
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": 500,
+        "apikey": API_KEY
+    }
 
-r = requests.get(url, params=params, timeout=15)  
-data = r.json()  
+    r = requests.get(url, params=params, timeout=15)
+    data = r.json()
 
-if "values" not in data:  
-    return None, data.get("message", "Market data error")  
+    if "values" not in data:
+        return None, data.get("message", "Market data error")
 
-df = pd.DataFrame(data["values"])  
+    df = pd.DataFrame(data["values"])
 
-df["datetime"] = pd.to_datetime(df["datetime"])  
+    df["datetime"] = pd.to_datetime(df["datetime"])
 
-for c in ["open", "high", "low", "close"]:  
-    df[c] = pd.to_numeric(df[c], errors="coerce")  
+    for c in ["open", "high", "low", "close"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-df = df.sort_values("datetime").reset_index(drop=True)  
+    df = df.sort_values("datetime").reset_index(drop=True)
 
-return df, None
+    return df, None
+
 
 def indicators(df):
-df = df.copy()
+    df = df.copy()
 
-df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()  
-df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()  
-df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()  
+    # EMA
+    df["ema9"] = df["close"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
 
-delta = df["close"].diff()  
+    df["ema21"] = df["close"].ewm(
+        span=21,
+        adjust=False
+    ).mean()
 
-gain = delta.clip(lower=0)  
-loss = -delta.clip(upper=0)  
+    df["ema50"] = df["close"].ewm(
+        span=50,
+        adjust=False
+    ).mean()
 
-avg_gain = gain.rolling(14).mean()  
-avg_loss = loss.rolling(14).mean()  
+    # RSI
+    delta = df["close"].diff()
 
-rs = avg_gain / avg_loss.replace(0, np.nan)  
-df["rsi"] = 100 - (100 / (1 + rs))  
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-ema12 = df["close"].ewm(span=12, adjust=False).mean()  
-ema26 = df["close"].ewm(span=26, adjust=False).mean()  
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
 
-df["macd"] = ema12 - ema26  
-df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()  
+    rs = avg_gain / avg_loss.replace(0, np.nan)
 
-tr1 = df["high"] - df["low"]  
-tr2 = abs(df["high"] - df["close"].shift())  
-tr3 = abs(df["low"] - df["close"].shift())  
+    df["rsi"] = 100 - (
+        100 / (1 + rs)
+    )
 
-tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)  
+    # MACD
+    ema12 = df["close"].ewm(
+        span=12,
+        adjust=False
+    ).mean()
 
-df["atr"] = tr.rolling(14).mean()  
-df["atr_avg"] = df["atr"].rolling(30).mean()  
+    ema26 = df["close"].ewm(
+        span=26,
+        adjust=False
+    ).mean()
 
-df["body"] = abs(df["close"] - df["open"])  
-df["range"] = df["high"] - df["low"]  
+    df["macd"] = ema12 - ema26
 
-df["body_ratio"] = (  
-    df["body"] / df["range"].replace(0, np.nan)  
-)  
+    df["macd_signal"] = df["macd"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
 
-df["momentum"] = df["close"].pct_change(3)  
+    # ATR
+    tr1 = df["high"] - df["low"]
 
-return df
+    tr2 = abs(
+        df["high"] - df["close"].shift()
+    )
+
+    tr3 = abs(
+        df["low"] - df["close"].shift()
+    )
+
+    tr = pd.concat(
+        [tr1, tr2, tr3],
+        axis=1
+    ).max(axis=1)
+
+    df["atr"] = tr.rolling(14).mean()
+
+    df["atr_avg"] = df["atr"].rolling(30).mean()
+
+    # Candle strength
+    df["body"] = abs(
+        df["close"] - df["open"]
+    )
+
+    df["range"] = (
+        df["high"] - df["low"]
+    )
+
+    df["body_ratio"] = (
+        df["body"] /
+        df["range"].replace(0, np.nan)
+    )
+
+    # Momentum
+    df["momentum"] = (
+        df["close"].pct_change(3)
+    )
+
+    return df
+
 
 def signal_engine(df):
-last = df.iloc[-1]
-prev = df.iloc[-2]
+    last = df.iloc[-1]
 
-up = 0  
-down = 0  
+    up = 0
+    down = 0
 
-reasons = []  
+    reasons = []
 
-# Trend  
-if last["ema9"] > last["ema21"] > last["ema50"]:  
-    up += 3  
-    reasons.append("Strong bullish EMA trend")  
+    # Trend
+    if (
+        last["ema9"] >
+        last["ema21"] >
+        last["ema50"]
+    ):
+        up += 3
+        reasons.append(
+            "Strong bullish EMA trend"
+        )
 
-elif last["ema9"] < last["ema21"] < last["ema50"]:  
-    down += 3  
-    reasons.append("Strong bearish EMA trend")  
+    elif (
+        last["ema9"] <
+        last["ema21"] <
+        last["ema50"]
+    ):
+        down += 3
+        reasons.append(
+            "Strong bearish EMA trend"
+        )
 
-# RSI  
-if 52 <= last["rsi"] <= 68:  
-    up += 2  
-    reasons.append("Bullish RSI zone")  
+    # RSI
+    if 52 <= last["rsi"] <= 68:
+        up += 2
+        reasons.append(
+            "Bullish RSI zone"
+        )
 
-elif 32 <= last["rsi"] <= 48:  
-    down += 2  
-    reasons.append("Bearish RSI zone")  
+    elif 32 <= last["rsi"] <= 48:
+        down += 2
+        reasons.append(
+            "Bearish RSI zone"
+        )
 
-# MACD  
-if last["macd"] > last["macd_signal"]:  
-    up += 2  
-    reasons.append("MACD bullish")  
+    # MACD
+    if last["macd"] > last["macd_signal"]:
+        up += 2
+        reasons.append(
+            "MACD bullish"
+        )
 
-elif last["macd"] < last["macd_signal"]:  
-    down += 2  
-    reasons.append("MACD bearish")  
+    elif last["macd"] < last["macd_signal"]:
+        down += 2
+        reasons.append(
+            "MACD bearish"
+        )
 
-# Momentum  
-if last["momentum"] > 0:  
-    up += 2  
-    reasons.append("Positive momentum")  
+    # Momentum
+    if last["momentum"] > 0:
+        up += 2
+        reasons.append(
+            "Positive momentum"
+        )
 
-elif last["momentum"] < 0:  
-    down += 2  
-    reasons.append("Negative momentum")  
+    elif last["momentum"] < 0:
+        down += 2
+        reasons.append(
+            "Negative momentum"
+        )
 
-# Candle strength  
-if last["body_ratio"] >= 0.55:  
-    if last["close"] > last["open"]:  
-        up += 2  
-        reasons.append("Strong bullish candle")  
-    else:  
-        down += 2  
-        reasons.append("Strong bearish candle")  
+    # Candle strength
+    if last["body_ratio"] >= 0.55:
 
-# Recent structure  
-recent_high = df["high"].iloc[-11:-1].max()  
-recent_low = df["low"].iloc[-11:-1].min()  
+        if last["close"] > last["open"]:
+            up += 2
+            reasons.append(
+                "Strong bullish candle"
+            )
 
-if last["close"] > recent_high:  
-    up += 2  
-    reasons.append("Recent high breakout")  
+        else:
+            down += 2
+            reasons.append(
+                "Strong bearish candle"
+            )
 
-elif last["close"] < recent_low:  
-    down += 2  
-    reasons.append("Recent low breakdown")  
+    # Recent structure
+    recent_high = (
+        df["high"]
+        .iloc[-11:-1]
+        .max()
+    )
 
-# Volatility confirmation  
-if pd.notna(last["atr"]) and pd.notna(last["atr_avg"]):  
-    if last["atr"] >= last["atr_avg"] * 0.75:  
-        if up > down:  
-            up += 1  
-        elif down > up:  
-            down += 1  
+    recent_low = (
+        df["low"]
+        .iloc[-11:-1]
+        .min()
+    )
 
-total = up + down  
+    if last["close"] > recent_high:
+        up += 2
+        reasons.append(
+            "Recent high breakout"
+        )
 
-if total == 0:  
-    return "UP", 50.0, up, down, ["No clear bias; forced direction"]  
+    elif last["close"] < recent_low:
+        down += 2
+        reasons.append(
+            "Recent low breakdown"
+        )
 
-if up >= down:  
-    direction = "UP"  
-    strength = round(up / total * 100, 1)  
-else:  
-    direction = "DOWN"  
-    strength = round(down / total * 100, 1)  
+    # Volatility confirmation
+    if (
+        pd.notna(last["atr"])
+        and
+        pd.notna(last["atr_avg"])
+    ):
 
-return direction, strength, up, down, reasons
+        if last["atr"] >= last["atr_avg"] * 0.75:
+
+            if up > down:
+                up += 1
+
+            elif down > up:
+                down += 1
+
+    total = up + down
+
+    # Always give a direction
+    if total == 0:
+        return (
+            "UP",
+            50.0,
+            up,
+            down,
+            ["No clear bias; forced direction"]
+        )
+
+    if up >= down:
+        direction = "UP"
+        strength = round(
+            up / total * 100,
+            1
+        )
+
+    else:
+        direction = "DOWN"
+        strength = round(
+            down / total * 100,
+            1
+        )
+
+    return (
+        direction,
+        strength,
+        up,
+        down,
+        reasons
+    )
+
 
 def backtest(df):
-wins = 0
-losses = 0
+    wins = 0
+    losses = 0
 
-rows = []  
+    rows = []
 
-for i in range(60, len(df) - 1):  
+    for i in range(60, len(df) - 1):
 
-    historical = df.iloc[:i + 1].copy()  
+        historical = df.iloc[
+            :i + 1
+        ].copy()
 
-    signal, strength, up, down, reasons = signal_engine(historical)  
+        (
+            signal,
+            strength,
+            up,
+            down,
+            reasons
+        ) = signal_engine(
+            historical
+        )
 
-    current = df.iloc[i]["close"]  
-    following = df.iloc[i + 1]["close"]  
+        current = df.iloc[i]["close"]
+        following = df.iloc[i + 1]["close"]
 
-    if signal == "UP":  
-        result = following > current  
-    else:  
-        result = following < current  
+        if signal == "UP":
+            result = following > current
+        else:
+            result = following < current
 
-    if result:  
-        wins += 1  
-        outcome = "WIN"  
-    else:  
-        losses += 1  
-        outcome = "LOSS"  
+        if result:
+            wins += 1
+            outcome = "WIN"
+        else:
+            losses += 1
+            outcome = "LOSS"
 
-    rows.append({  
-        "time": df.iloc[i]["datetime"],  
-        "signal": signal,  
-        "strength": strength,  
-        "result": outcome  
-    })  
+        rows.append({
+            "time": df.iloc[i]["datetime"],
+            "signal": signal,
+            "strength": strength,
+            "result": outcome
+        })
 
-total = wins + losses  
+    total = wins + losses
 
-accuracy = (wins / total * 100) if total else 0  
+    accuracy = (
+        wins / total * 100
+        if total
+        else 0
+    )
 
-return accuracy, wins, losses, pd.DataFrame(rows)
+    return (
+        accuracy,
+        wins,
+        losses,
+        pd.DataFrame(rows)
+    )
+
+
+# =========================================================
+# USER INTERFACE
+# =========================================================
 
 st.title("📊 Live Trading Signal Bot")
 
 st.caption(
-"Real-time market analysis + historical backtesting"
+    "Real-time market analysis + historical backtesting"
 )
+
 
 if not API_KEY:
-st.error("Twelve Data API key is missing.")
-st.stop()
+    st.error(
+        "Twelve Data API key is missing."
+    )
+    st.stop()
 
-pair = st.selectbox("Pair", PAIRS)
+
+pair = st.selectbox(
+    "Pair",
+    PAIRS
+)
+
 
 timeframe = st.selectbox(
-"Timeframe",
-list(TIMEFRAMES.keys())
+    "Timeframe",
+    list(TIMEFRAMES.keys())
 )
+
 
 if st.button(
-"🚀 START ANALYZE",
-use_container_width=True
+    "🚀 START ANALYZE",
+    use_container_width=True
 ):
 
-with st.spinner("Analyzing market..."):  
+    with st.spinner(
+        "Analyzing market..."
+    ):
 
-    df, error = get_data(  
-        pair,  
-        TIMEFRAMES[timeframe]  
-    )  
+        df, error = get_data(
+            pair,
+            TIMEFRAMES[timeframe]
+        )
 
-    if error:  
-        st.error(error)  
-        st.stop()  
+        if error:
+            st.error(error)
+            st.stop()
 
-    df = indicators(df)  
+        df = indicators(df)
 
-    signal, strength, up, down, reasons = signal_engine(df)  
+        (
+            signal,
+            strength,
+            up,
+            down,
+            reasons
+        ) = signal_engine(df)
 
-    accuracy, wins, losses, history = backtest(df)  
+        (
+            accuracy,
+            wins,
+            losses,
+            history
+        ) = backtest(df)
 
-    price = df.iloc[-1]["close"]  
+        price = df.iloc[-1]["close"]
 
-st.success("Analysis completed")  
 
-st.metric(  
-    "Live Price",  
-    f"{price:.6f}"  
-)  
+    st.success(
+        "Analysis completed"
+    )
 
-if signal == "UP":  
-    st.success("🟢 SIGNAL: UP")  
-else:  
-    st.error("🔴 SIGNAL: DOWN")  
 
-st.metric(  
-    "Signal Strength",  
-    f"{strength}%"  
-)  
+    st.metric(
+        "Live Price",
+        f"{price:.6f}"
+    )
 
-st.divider()  
 
-col1, col2 = st.columns(2)  
+    if signal == "UP":
+        st.success(
+            "🟢 SIGNAL: UP"
+        )
 
-with col1:  
-    st.metric("UP Score", up)  
+    else:
+        st.error(
+            "🔴 SIGNAL: DOWN"
+        )
 
-with col2:  
-    st.metric("DOWN Score", down)  
 
-st.write("### 🧠 Analysis")  
+    st.metric(
+        "Signal Strength",
+        f"{strength}%"
+    )
 
-for reason in reasons:  
-    st.write("•", reason)  
 
-st.divider()  
+    st.divider()
 
-st.write("### 🧪 Historical Backtest")  
 
-c1, c2, c3 = st.columns(3)  
+    col1, col2 = st.columns(2)
 
-with c1:  
-    st.metric(  
-        "Accuracy",  
-        f"{accuracy:.2f}%"  
-    )  
 
-with c2:  
-    st.metric(  
-        "WIN",  
-        wins  
-    )  
+    with col1:
+        st.metric(
+            "UP Score",
+            up
+        )
 
-with c3:  
-    st.metric(  
-        "LOSS",  
-        losses  
-    )  
 
-st.caption(  
-    f"Tested on {len(history)} historical signals."  
-)  
+    with col2:
+        st.metric(
+            "DOWN Score",
+            down
+        )
 
-st.write("### 🕒 Signal Time")  
 
-st.write(  
-    datetime.now().strftime(  
-        "%Y-%m-%d %H:%M:%S"  
-    )  
-)  
+    st.write(
+        "### 🧠 Analysis"
+    )
 
-st.warning(  
-    "Historical accuracy does not guarantee future results."  
-)
+
+    for reason in reasons:
+        st.write(
+            "•",
+            reason
+        )
+
+
+    st.divider()
+
+
+    st.write(
+        "### 🧪 Historical Backtest"
+    )
+
+
+    c1, c2, c3 = st.columns(3)
+
+
+    with c1:
+        st.metric(
+            "Accuracy",
+            f"{accuracy:.2f}%"
+        )
+
+
+    with c2:
+        st.metric(
+            "WIN",
+            wins
+        )
+
+
+    with c3:
+        st.metric(
+            "LOSS",
+            losses
+        )
+
+
+    st.caption(
+        f"Tested on {len(history)} historical signals."
+    )
+
+
+    st.write(
+        "### 🕒 Signal Time"
+    )
+
+
+    st.write(
+        datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    )
+
+
+    st.warning(
+        "Historical accuracy does not guarantee future results."
+    )
+
+"requirements.txt":
+
+streamlit
+requests
+pandas
+numpy
