@@ -1,513 +1,340 @@
-    with info2:
-
-        st.markdown(
-            f"""
-            <div class="glass-card">
-                <div class="small-label">
-                    Timeframe
-                </div>
-
-                <div class="big-value">
-                    {timeframe}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with info3:
-
-        st.markdown(
-            f"""
-            <div class="glass-card">
-                <div class="small-label">
-                    Live Price
-                </div>
-
-                <div class="big-value">
-                    {price:.6f}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with info4:
-
-        st.markdown(
-            f"""
-            <div class="glass-card">
-                <div class="small-label">
-                    Signal Time
-                </div>
-
-                <div class="big-value">
-                    {datetime.now().strftime("%H:%M:%S")}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-
-    # =====================================================
-    # SIGNAL
-    # =====================================================
-
-    st.markdown(
-        '<div class="section-title">🎯 Current Trading Direction</div>',
-        unsafe_allow_html=True
-    )
-
-    signal_class = (
-        "signal-up"
-        if signal == "UP"
-        else "signal-down"
-    )
-
-    signal_text_class = (
-        "signal-text-up"
-        if signal == "UP"
-        else "signal-text-down"
-    )
-
-    signal_icon = "🟢" if signal == "UP" else "🔴"
-
-    st.markdown(
-        f"""
-        <div class="{signal_class}">
-
-            <div class="signal-icon">
-                {signal_icon}
-            </div>
-
-            <div class="{signal_text_class}">
-                {signal}
-            </div>
-
-            <div class="signal-strength">
-                Signal Strength: {strength}%
-            </div>
-
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-    # =====================================================
-    # SIGNAL STRENGTH
-    # =====================================================
-
-    st.markdown(
-        '<div class="section-title">📊 Signal Strength</div>',
-        unsafe_allow_html=True
-    )
+import streamlit as st
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime
 
-    progress_class = (
-        "progress-up"
-        if signal == "UP"
-        else "progress-down"
-    )
+st.set_page_config(
+page_title="Live Trading Signal Bot",
+page_icon="📊"
+)
 
-    st.markdown(
-        f"""
-        <div class="glass-card">
+API_KEY = st.secrets.get("TWELVE_DATA_API_KEY", "")
 
-            <div class="small-label">
-                {signal} CONFIDENCE SCORE
-            </div>
+PAIRS = [
+"EUR/USD",
+"GBP/USD",
+"USD/JPY",
+"USD/CHF",
+"AUD/USD",
+"USD/CAD",
+"NZD/USD"
+]
 
-            <div class="big-value">
-                {strength}%
-            </div>
+TIMEFRAMES = {
+"1 Minute": "1min",
+"5 Minutes": "5min",
+"15 Minutes": "15min"
+}
 
-            <div class="progress-bg">
+def get_data(symbol, interval):
+url = "https://api.twelvedata.com/time_series"
 
-                <div
-                    class="{progress_class}"
-                    style="width:{strength}%;">
-                </div>
+params = {  
+    "symbol": symbol,  
+    "interval": interval,  
+    "outputsize": 500,  
+    "apikey": API_KEY  
+}  
 
-            </div>
+r = requests.get(url, params=params, timeout=15)  
+data = r.json()  
 
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+if "values" not in data:  
+    return None, data.get("message", "Market data error")  
 
+df = pd.DataFrame(data["values"])  
 
-    # =====================================================
-    # UP / DOWN SCORES
-    # =====================================================
+df["datetime"] = pd.to_datetime(df["datetime"])  
 
-    st.markdown(
-        '<div class="section-title">⚖️ Market Direction Scores</div>',
-        unsafe_allow_html=True
-    )
+for c in ["open", "high", "low", "close"]:  
+    df[c] = pd.to_numeric(df[c], errors="coerce")  
 
-    score1, score2 = st.columns(2)
+df = df.sort_values("datetime").reset_index(drop=True)  
 
-    total_score = up + down
+return df, None
 
-    if total_score > 0:
-        up_percent = up / total_score * 100
-        down_percent = down / total_score * 100
-    else:
-        up_percent = 50
-        down_percent = 50
+def indicators(df):
+df = df.copy()
 
-    with score1:
+df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()  
+df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()  
+df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()  
 
-        st.markdown(
-            f"""
-            <div class="glass-card">
+delta = df["close"].diff()  
 
-                <div class="small-label">
-                    🟢 UP SCORE
-                </div>
+gain = delta.clip(lower=0)  
+loss = -delta.clip(upper=0)  
 
-                <div class="big-value">
-                    {up}
-                </div>
+avg_gain = gain.rolling(14).mean()  
+avg_loss = loss.rolling(14).mean()  
 
-                <div class="progress-bg">
+rs = avg_gain / avg_loss.replace(0, np.nan)  
+df["rsi"] = 100 - (100 / (1 + rs))  
 
-                    <div
-                        class="progress-up"
-                        style="width:{up_percent:.1f}%;">
-                    </div>
+ema12 = df["close"].ewm(span=12, adjust=False).mean()  
+ema26 = df["close"].ewm(span=26, adjust=False).mean()  
 
-                </div>
+df["macd"] = ema12 - ema26  
+df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()  
 
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+tr1 = df["high"] - df["low"]  
+tr2 = abs(df["high"] - df["close"].shift())  
+tr3 = abs(df["low"] - df["close"].shift())  
 
-    with score2:
+tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)  
 
-        st.markdown(
-            f"""
-            <div class="glass-card">
+df["atr"] = tr.rolling(14).mean()  
+df["atr_avg"] = df["atr"].rolling(30).mean()  
 
-                <div class="small-label">
-                    🔴 DOWN SCORE
-                </div>
+df["body"] = abs(df["close"] - df["open"])  
+df["range"] = df["high"] - df["low"]  
 
-                <div class="big-value">
-                    {down}
-                </div>
+df["body_ratio"] = (  
+    df["body"] / df["range"].replace(0, np.nan)  
+)  
 
-                <div class="progress-bg">
+df["momentum"] = df["close"].pct_change(3)  
 
-                    <div
-                        class="progress-down"
-                        style="width:{down_percent:.1f}%;">
-                    </div>
+return df
 
-                </div>
+def signal_engine(df):
+last = df.iloc[-1]
+prev = df.iloc[-2]
 
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+up = 0  
+down = 0  
+
+reasons = []  
 
+# Trend  
+if last["ema9"] > last["ema21"] > last["ema50"]:  
+    up += 3  
+    reasons.append("Strong bullish EMA trend")  
+
+elif last["ema9"] < last["ema21"] < last["ema50"]:  
+    down += 3  
+    reasons.append("Strong bearish EMA trend")  
+
+# RSI  
+if 52 <= last["rsi"] <= 68:  
+    up += 2  
+    reasons.append("Bullish RSI zone")  
+
+elif 32 <= last["rsi"] <= 48:  
+    down += 2  
+    reasons.append("Bearish RSI zone")  
+
+# MACD  
+if last["macd"] > last["macd_signal"]:  
+    up += 2  
+    reasons.append("MACD bullish")  
 
-    # =====================================================
-    # TECHNICAL ANALYSIS
-    # =====================================================
+elif last["macd"] < last["macd_signal"]:  
+    down += 2  
+    reasons.append("MACD bearish")  
 
-    st.markdown(
-        '<div class="section-title">📈 Technical Analysis</div>',
-        unsafe_allow_html=True
-    )
+# Momentum  
+if last["momentum"] > 0:  
+    up += 2  
+    reasons.append("Positive momentum")  
 
-    tech1, tech2, tech3 = st.columns(3)
+elif last["momentum"] < 0:  
+    down += 2  
+    reasons.append("Negative momentum")  
 
-    with tech1:
+# Candle strength  
+if last["body_ratio"] >= 0.55:  
+    if last["close"] > last["open"]:  
+        up += 2  
+        reasons.append("Strong bullish candle")  
+    else:  
+        down += 2  
+        reasons.append("Strong bearish candle")  
 
-        rsi_display = (
-            f"{rsi_value:.2f}"
-            if pd.notna(rsi_value)
-            else "N/A"
-        )
+# Recent structure  
+recent_high = df["high"].iloc[-11:-1].max()  
+recent_low = df["low"].iloc[-11:-1].min()  
 
-        st.markdown(
-            f"""
-            <div class="glass-card">
+if last["close"] > recent_high:  
+    up += 2  
+    reasons.append("Recent high breakout")  
 
-                <div class="small-label">
-                    RSI
-                </div>
+elif last["close"] < recent_low:  
+    down += 2  
+    reasons.append("Recent low breakdown")  
 
-                <div class="big-value">
-                    {rsi_display}
-                </div>
+# Volatility confirmation  
+if pd.notna(last["atr"]) and pd.notna(last["atr_avg"]):  
+    if last["atr"] >= last["atr_avg"] * 0.75:  
+        if up > down:  
+            up += 1  
+        elif down > up:  
+            down += 1  
 
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+total = up + down  
 
-    with tech2:
+if total == 0:  
+    return "UP", 50.0, up, down, ["No clear bias; forced direction"]  
 
-        macd_display = (
-            f"{macd_value:.6f}"
-            if pd.notna(macd_value)
-            else "N/A"
-        )
+if up >= down:  
+    direction = "UP"  
+    strength = round(up / total * 100, 1)  
+else:  
+    direction = "DOWN"  
+    strength = round(down / total * 100, 1)  
 
-        st.markdown(
-            f"""
-            <div class="glass-card">
+return direction, strength, up, down, reasons
 
-                <div class="small-label">
-                    MACD
-                </div>
+def backtest(df):
+wins = 0
+losses = 0
 
-                <div class="big-value">
-                    {macd_display}
-                </div>
+rows = []  
 
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+for i in range(60, len(df) - 1):  
 
-    with tech3:
+    historical = df.iloc[:i + 1].copy()  
 
-        momentum_display = (
-            f"{momentum_value * 100:.4f}%"
-            if pd.notna(momentum_value)
-            else "N/A"
-        )
+    signal, strength, up, down, reasons = signal_engine(historical)  
 
-        st.markdown(
-            f"""
-            <div class="glass-card">
+    current = df.iloc[i]["close"]  
+    following = df.iloc[i + 1]["close"]  
 
-                <div class="small-label">
-                    MOMENTUM
-                </div>
+    if signal == "UP":  
+        result = following > current  
+    else:  
+        result = following < current  
 
-                <div class="big-value">
-                    {momentum_display}
-                </div>
+    if result:  
+        wins += 1  
+        outcome = "WIN"  
+    else:  
+        losses += 1  
+        outcome = "LOSS"  
 
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+    rows.append({  
+        "time": df.iloc[i]["datetime"],  
+        "signal": signal,  
+        "strength": strength,  
+        "result": outcome  
+    })  
 
+total = wins + losses  
 
-    # =====================================================
-    # ANALYSIS REASONS
-    # =====================================================
+accuracy = (wins / total * 100) if total else 0  
 
-    st.markdown(
-        '<div class="section-title">🧠 Market Analysis Reasons</div>',
-        unsafe_allow_html=True
-    )
+return accuracy, wins, losses, pd.DataFrame(rows)
 
-    reason_html = ""
+st.title("📊 Live Trading Signal Bot")
 
-    for reason in reasons:
+st.caption(
+"Real-time market analysis + historical backtesting"
+)
 
-        reason_html += f"""
-        <div class="reason">
-            ✓ {reason}
-        </div>
-        """
+if not API_KEY:
+st.error("Twelve Data API key is missing.")
+st.stop()
 
-    st.markdown(
-        f"""
-        <div class="glass-card">
-            {reason_html}
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+pair = st.selectbox("Pair", PAIRS)
 
+timeframe = st.selectbox(
+"Timeframe",
+list(TIMEFRAMES.keys())
+)
 
-    # =====================================================
-    # BACKTEST
-    # =====================================================
+if st.button(
+"🚀 START ANALYZE",
+use_container_width=True
+):
 
-    st.markdown(
-        '<div class="section-title">📚 Historical Backtest</div>',
-        unsafe_allow_html=True
-    )
+with st.spinner("Analyzing market..."):  
 
-    bt1, bt2, bt3, bt4 = st.columns(4)
+    df, error = get_data(  
+        pair,  
+        TIMEFRAMES[timeframe]  
+    )  
 
-    with bt1:
+    if error:  
+        st.error(error)  
+        st.stop()  
 
-        st.markdown(
-            f"""
-            <div class="glass-card">
+    df = indicators(df)  
 
-                <div class="small-label">
-                    ACCURACY
-                </div>
+    signal, strength, up, down, reasons = signal_engine(df)  
 
-                <div class="big-value">
-                    {accuracy:.1f}%
-                </div>
+    accuracy, wins, losses, history = backtest(df)  
 
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+    price = df.iloc[-1]["close"]  
 
-    with bt2:
+st.success("Analysis completed")  
 
-        st.markdown(
-            f"""
-            <div class="glass-card">
+st.metric(  
+    "Live Price",  
+    f"{price:.6f}"  
+)  
 
-                <div class="small-label">
-                    WINS
-                </div>
+if signal == "UP":  
+    st.success("🟢 SIGNAL: UP")  
+else:  
+    st.error("🔴 SIGNAL: DOWN")  
 
-                <div class="big-value">
-                    {wins}
-                </div>
+st.metric(  
+    "Signal Strength",  
+    f"{strength}%"  
+)  
 
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+st.divider()  
 
-    with bt3:
+col1, col2 = st.columns(2)  
 
-        st.markdown(
-            f"""
-            <div class="glass-card">
+with col1:  
+    st.metric("UP Score", up)  
 
-                <div class="small-label">
-                    LOSSES
-                </div>
+with col2:  
+    st.metric("DOWN Score", down)  
 
-                <div class="big-value">
-                    {losses}
-                </div>
+st.write("### 🧠 Analysis")  
 
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+for reason in reasons:  
+    st.write("•", reason)  
 
-    with bt4:
+st.divider()  
 
-        tested = wins + losses
+st.write("### 🧪 Historical Backtest")  
 
-        st.markdown(
-            f"""
-            <div class="glass-card">
+c1, c2, c3 = st.columns(3)  
 
-                <div class="small-label">
-                    TESTED SIGNALS
-                </div>
+with c1:  
+    st.metric(  
+        "Accuracy",  
+        f"{accuracy:.2f}%"  
+    )  
 
-                <div class="big-value">
-                    {tested}
-                </div>
+with c2:  
+    st.metric(  
+        "WIN",  
+        wins  
+    )  
 
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+with c3:  
+    st.metric(  
+        "LOSS",  
+        losses  
+    )  
 
+st.caption(  
+    f"Tested on {len(history)} historical signals."  
+)  
 
-    # =====================================================
-    # BACKTEST CHART
-    # =====================================================
+st.write("### 🕒 Signal Time")  
 
-    if not history.empty:
+st.write(  
+    datetime.now().strftime(  
+        "%Y-%m-%d %H:%M:%S"  
+    )  
+)  
 
-        st.markdown(
-            '<div class="section-title">📉 Historical Signal Strength</div>',
-            unsafe_allow_html=True
-        )
-
-        chart_data = history[
-            ["time", "strength"]
-        ].copy()
-
-        chart_data = chart_data.set_index(
-            "time"
-        )
-
-        st.line_chart(
-            chart_data,
-            use_container_width=True
-        )
-
-
-    # =====================================================
-    # SIGNAL DETAILS
-    # =====================================================
-
-    st.markdown(
-        '<div class="section-title">ℹ️ Signal Information</div>',
-        unsafe_allow_html=True
-    )
-
-    st.markdown(
-        f"""
-        <div class="glass-card">
-
-            <div class="reason">
-                💱 Pair: <b>{pair}</b>
-            </div>
-
-            <div class="reason">
-                ⏱️ Timeframe: <b>{timeframe}</b>
-            </div>
-
-            <div class="reason">
-                💰 Current Price: <b>{price:.6f}</b>
-            </div>
-
-            <div class="reason">
-                🎯 Direction: <b>{signal}</b>
-            </div>
-
-            <div class="reason">
-                📊 Strength: <b>{strength}%</b>
-            </div>
-
-            <div class="reason">
-                🕐 Analysis Time:
-                <b>{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</b>
-            </div>
-
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-    # =====================================================
-    # DISCLAIMER
-    # =====================================================
-
-    st.warning(
-        "Signal strength indicator agreement ko show karta hai; "
-        "ye guaranteed probability ya guaranteed profit nahi hai."
-    )
-
-
-# =========================================================
-# FOOTER
-# =========================================================
-
-st.markdown(
-    """
-    <div class="footer">
-        Live Trading Signal Bot • Technical Analysis Dashboard
-    </div>
-    """,
-    unsafe_allow_html=True
+st.warning(  
+    "Historical accuracy does not guarantee future results."  
 )
