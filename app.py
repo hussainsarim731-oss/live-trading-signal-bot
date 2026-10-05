@@ -2,1050 +2,339 @@ import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
-import websocket
-import threading
-import json
-import time
-from collections import deque
 from datetime import datetime
 
 st.set_page_config(
-    page_title="Live Trading Signal Bot",
-    page_icon="📊"
+page_title="Live Trading Signal Bot",
+page_icon="📊"
 )
 
 API_KEY = st.secrets.get("TWELVE_DATA_API_KEY", "")
 
 PAIRS = [
-    "EUR/USD",
-    "GBP/USD",
-    "USD/JPY",
-    "USD/CHF",
-    "AUD/USD",
-    "USD/CAD",
-    "NZD/USD"
+"EUR/USD",
+"GBP/USD",
+"USD/JPY",
+"USD/CHF",
+"AUD/USD",
+"USD/CAD",
+"NZD/USD"
 ]
 
 TIMEFRAMES = {
-    "5 Seconds": 5,
-    "10 Seconds": 10,
-    "15 Seconds": 15,
-    "30 Seconds": 30,
-    "1 Minute": 60
+"1 Minute": "1min",
+"5 Minutes": "5min",
+"15 Minutes": "15min"
 }
 
+def get_data(symbol, interval):
+url = "https://api.twelvedata.com/time_series"
 
-# =========================================================
-# LIVE TICK COLLECTOR
-# =========================================================
+params = {  
+    "symbol": symbol,  
+    "interval": interval,  
+    "outputsize": 500,  
+    "apikey": API_KEY  
+}  
 
-@st.cache_resource
-def create_collector(api_key):
+r = requests.get(url, params=params, timeout=15)  
+data = r.json()  
 
-    class Collector:
+if "values" not in data:  
+    return None, data.get("message", "Market data error")  
 
-        def __init__(self):
-            self.ticks = deque(maxlen=20000)
-            self.lock = threading.Lock()
-            self.ws = None
-            self.connected = False
-            self.symbol = None
-            self.last_price = None
-            self.last_tick = None
+df = pd.DataFrame(data["values"])  
 
-            thread = threading.Thread(
-                target=self.connect,
-                daemon=True
-            )
+df["datetime"] = pd.to_datetime(df["datetime"])  
 
-            thread.start()
+for c in ["open", "high", "low", "close"]:  
+    df[c] = pd.to_numeric(df[c], errors="coerce")  
 
-        def connect(self):
+df = df.sort_values("datetime").reset_index(drop=True)  
 
-            while True:
+return df, None
 
-                try:
+def indicators(df):
+df = df.copy()
 
-                    url = (
-                        "wss://ws.twelvedata.com/"
-                        "v1/quotes/price?apikey="
-                        + self.api_key
-                    )
+df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()  
+df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()  
+df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()  
 
-                    self.ws = websocket.WebSocketApp(
-                        url,
-                        on_open=self.on_open,
-                        on_message=self.on_message,
-                        on_error=self.on_error,
-                        on_close=self.on_close
-                    )
+delta = df["close"].diff()  
 
-                    self.ws.run_forever(
-                        ping_interval=10,
-                        ping_timeout=5
-                    )
+gain = delta.clip(lower=0)  
+loss = -delta.clip(upper=0)  
 
-                except Exception:
-                    pass
+avg_gain = gain.rolling(14).mean()  
+avg_loss = loss.rolling(14).mean()  
 
-                self.connected = False
+rs = avg_gain / avg_loss.replace(0, np.nan)  
+df["rsi"] = 100 - (100 / (1 + rs))  
 
-                time.sleep(3)
+ema12 = df["close"].ewm(span=12, adjust=False).mean()  
+ema26 = df["close"].ewm(span=26, adjust=False).mean()  
 
-        def on_open(self, ws):
+df["macd"] = ema12 - ema26  
+df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()  
 
-            self.connected = True
+tr1 = df["high"] - df["low"]  
+tr2 = abs(df["high"] - df["close"].shift())  
+tr3 = abs(df["low"] - df["close"].shift())  
 
-            if self.symbol:
+tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)  
 
-                self.subscribe(
-                    self.symbol
-                )
+df["atr"] = tr.rolling(14).mean()  
+df["atr_avg"] = df["atr"].rolling(30).mean()  
 
-        def subscribe(self, symbol):
+df["body"] = abs(df["close"] - df["open"])  
+df["range"] = df["high"] - df["low"]  
 
-            try:
+df["body_ratio"] = (  
+    df["body"] / df["range"].replace(0, np.nan)  
+)  
 
-                message = {
-                    "action": "subscribe",
-                    "params": {
-                        "symbols": symbol
-                    }
-                }
+df["momentum"] = df["close"].pct_change(3)  
 
-                self.ws.send(
-                    json.dumps(message)
-                )
+return df
 
-            except Exception:
-                pass
+def signal_engine(df):
+last = df.iloc[-1]
+prev = df.iloc[-2]
 
-        def change_symbol(self, symbol):
+up = 0  
+down = 0  
 
-            self.symbol = symbol
+reasons = []  
 
-            with self.lock:
-                self.ticks.clear()
+# Trend  
+if last["ema9"] > last["ema21"] > last["ema50"]:  
+    up += 3  
+    reasons.append("Strong bullish EMA trend")  
 
-            self.last_price = None
-            self.last_tick = None
+elif last["ema9"] < last["ema21"] < last["ema50"]:  
+    down += 3  
+    reasons.append("Strong bearish EMA trend")  
 
-            if self.connected:
-                self.subscribe(symbol)
+# RSI  
+if 52 <= last["rsi"] <= 68:  
+    up += 2  
+    reasons.append("Bullish RSI zone")  
 
-        def on_message(self, ws, message):
+elif 32 <= last["rsi"] <= 48:  
+    down += 2  
+    reasons.append("Bearish RSI zone")  
 
-            try:
-                data = json.loads(message)
-            except Exception:
-                return
+# MACD  
+if last["macd"] > last["macd_signal"]:  
+    up += 2  
+    reasons.append("MACD bullish")  
 
-            if data.get("event") != "price":
-                return
+elif last["macd"] < last["macd_signal"]:  
+    down += 2  
+    reasons.append("MACD bearish")  
 
-            symbol = data.get("symbol")
-            price = data.get("price")
-            timestamp = data.get("timestamp")
+# Momentum  
+if last["momentum"] > 0:  
+    up += 2  
+    reasons.append("Positive momentum")  
 
-            if symbol is None or price is None:
-                return
+elif last["momentum"] < 0:  
+    down += 2  
+    reasons.append("Negative momentum")  
 
-            try:
-                price = float(price)
-            except Exception:
-                return
+# Candle strength  
+if last["body_ratio"] >= 0.55:  
+    if last["close"] > last["open"]:  
+        up += 2  
+        reasons.append("Strong bullish candle")  
+    else:  
+        down += 2  
+        reasons.append("Strong bearish candle")  
 
-            try:
+# Recent structure  
+recent_high = df["high"].iloc[-11:-1].max()  
+recent_low = df["low"].iloc[-11:-1].min()  
 
-                if timestamp is not None:
-                    ts = pd.to_datetime(
-                        float(timestamp),
-                        unit="s",
-                        utc=True
-                    )
-                else:
-                    ts = pd.Timestamp.now(
-                        tz="UTC"
-                    )
+if last["close"] > recent_high:  
+    up += 2  
+    reasons.append("Recent high breakout")  
 
-            except Exception:
+elif last["close"] < recent_low:  
+    down += 2  
+    reasons.append("Recent low breakdown")  
 
-                ts = pd.Timestamp.now(
-                    tz="UTC"
-                )
+# Volatility confirmation  
+if pd.notna(last["atr"]) and pd.notna(last["atr_avg"]):  
+    if last["atr"] >= last["atr_avg"] * 0.75:  
+        if up > down:  
+            up += 1  
+        elif down > up:  
+            down += 1  
 
-            with self.lock:
+total = up + down  
 
-                self.ticks.append({
-                    "datetime": ts,
-                    "price": price
-                })
+if total == 0:  
+    return "UP", 50.0, up, down, ["No clear bias; forced direction"]  
 
-            self.last_price = price
-            self.last_tick = ts
+if up >= down:  
+    direction = "UP"  
+    strength = round(up / total * 100, 1)  
+else:  
+    direction = "DOWN"  
+    strength = round(down / total * 100, 1)  
 
-        def on_error(self, ws, error):
-            self.connected = False
+return direction, strength, up, down, reasons
 
-        def on_close(
-            self,
-            ws,
-            close_status_code,
-            close_msg
-        ):
-            self.connected = False
+def backtest(df):
+wins = 0
+losses = 0
 
-        def get_ticks(self):
+rows = []  
 
-            with self.lock:
-                return list(self.ticks)
+for i in range(60, len(df) - 1):  
 
-        def count(self):
+    historical = df.iloc[:i + 1].copy()  
 
-            with self.lock:
-                return len(self.ticks)
+    signal, strength, up, down, reasons = signal_engine(historical)  
 
-    return Collector()
+    current = df.iloc[i]["close"]  
+    following = df.iloc[i + 1]["close"]  
 
+    if signal == "UP":  
+        result = following > current  
+    else:  
+        result = following < current  
 
-# =========================================================
-# BUILD REAL CANDLES FROM TICKS
-# =========================================================
+    if result:  
+        wins += 1  
+        outcome = "WIN"  
+    else:  
+        losses += 1  
+        outcome = "LOSS"  
 
-def make_candles(collector, seconds):
+    rows.append({  
+        "time": df.iloc[i]["datetime"],  
+        "signal": signal,  
+        "strength": strength,  
+        "result": outcome  
+    })  
 
-    ticks = collector.get_ticks()
+total = wins + losses  
 
-    if len(ticks) < 2:
-        return None
+accuracy = (wins / total * 100) if total else 0  
 
-    df = pd.DataFrame(ticks)
+return accuracy, wins, losses, pd.DataFrame(rows)
 
-    df["datetime"] = pd.to_datetime(
-        df["datetime"],
-        errors="coerce",
-        utc=True
-    )
-
-    df["price"] = pd.to_numeric(
-        df["price"],
-        errors="coerce"
-    )
-
-    df = df.dropna(
-        subset=["datetime", "price"]
-    )
-
-    if len(df) < 2:
-        return None
-
-    df = df.sort_values(
-        "datetime"
-    )
-
-    df = df.set_index(
-        "datetime"
-    )
-
-    candles = df["price"].resample(
-        f"{seconds}s",
-        label="left",
-        closed="left"
-    ).ohlc()
-
-    candles = candles.dropna()
-
-    if candles.empty:
-        return None
-
-    candles = candles.reset_index()
-
-    candles.columns = [
-        "datetime",
-        "open",
-        "high",
-        "low",
-        "close"
-    ]
-
-    return candles
-
-
-# =========================================================
-# 1 MINUTE DATA
-# =========================================================
-
-def get_data(symbol):
-
-    try:
-
-        response = requests.get(
-            "https://api.twelvedata.com/time_series",
-            params={
-                "symbol": symbol,
-                "interval": "1min",
-                "outputsize": 500,
-                "apikey": API_KEY
-            },
-            timeout=15
-        )
-
-        data = response.json()
-
-    except Exception as e:
-
-        return None, str(e)
-
-    if "values" not in data:
-
-        return None, data.get(
-            "message",
-            "Market data error"
-        )
-
-    df = pd.DataFrame(
-        data["values"]
-    )
-
-    df["datetime"] = pd.to_datetime(
-        df["datetime"]
-    )
-
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close"
-    ]:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
-
-    df = df.dropna()
-
-    df = df.sort_values(
-        "datetime"
-    ).reset_index(
-        drop=True
-    )
-
-    return df, None
-
-
-# =========================================================
-# INDICATORS
-# =========================================================
-
-def add_indicators(df):
-
-    df = df.copy()
-
-    df["ema9"] = df["close"].ewm(
-        span=9,
-        adjust=False
-    ).mean()
-
-    df["ema21"] = df["close"].ewm(
-        span=21,
-        adjust=False
-    ).mean()
-
-    df["ema50"] = df["close"].ewm(
-        span=50,
-        adjust=False
-    ).mean()
-
-    delta = df["close"].diff()
-
-    gain = delta.clip(
-        lower=0
-    )
-
-    loss = -delta.clip(
-        upper=0
-    )
-
-    avg_gain = gain.rolling(
-        14,
-        min_periods=1
-    ).mean()
-
-    avg_loss = loss.rolling(
-        14,
-        min_periods=1
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(
-        0,
-        np.nan
-    )
-
-    df["rsi"] = (
-        100 -
-        (
-            100 /
-            (1 + rs)
-        )
-    )
-
-    df["rsi"] = df["rsi"].fillna(50)
-
-    ema12 = df["close"].ewm(
-        span=12,
-        adjust=False
-    ).mean()
-
-    ema26 = df["close"].ewm(
-        span=26,
-        adjust=False
-    ).mean()
-
-    df["macd"] = (
-        ema12 - ema26
-    )
-
-    df["macd_signal"] = (
-        df["macd"].ewm(
-            span=9,
-            adjust=False
-        ).mean()
-    )
-
-    tr1 = (
-        df["high"] -
-        df["low"]
-    )
-
-    tr2 = abs(
-        df["high"] -
-        df["close"].shift()
-    )
-
-    tr3 = abs(
-        df["low"] -
-        df["close"].shift()
-    )
-
-    tr = pd.concat(
-        [tr1, tr2, tr3],
-        axis=1
-    ).max(axis=1)
-
-    df["atr"] = tr.rolling(
-        14,
-        min_periods=1
-    ).mean()
-
-    df["atr_avg"] = df["atr"].rolling(
-        30,
-        min_periods=1
-    ).mean()
-
-    df["body"] = abs(
-        df["close"] -
-        df["open"]
-    )
-
-    df["range"] = (
-        df["high"] -
-        df["low"]
-    )
-
-    df["body_ratio"] = (
-        df["body"] /
-        df["range"].replace(
-            0,
-            np.nan
-        )
-    ).fillna(0)
-
-    df["momentum"] = (
-        df["close"].pct_change(3)
-        .fillna(0)
-    )
-
-    return df
-
-
-# =========================================================
-# SIGNAL
-# =========================================================
-
-def get_signal(df):
-
-    if df is None or len(df) == 0:
-
-        return (
-            "UP",
-            50.0,
-            0,
-            0,
-            ["Waiting for live ticks"]
-        )
-
-    last = df.iloc[-1]
-
-    up = 0
-    down = 0
-    reasons = []
-
-    # EMA
-    if (
-        last["ema9"] >
-        last["ema21"] >
-        last["ema50"]
-    ):
-
-        up += 3
-        reasons.append(
-            "Bullish EMA trend"
-        )
-
-    elif (
-        last["ema9"] <
-        last["ema21"] <
-        last["ema50"]
-    ):
-
-        down += 3
-        reasons.append(
-            "Bearish EMA trend"
-        )
-
-    # RSI
-    if 52 <= last["rsi"] <= 68:
-
-        up += 2
-        reasons.append(
-            "Bullish RSI"
-        )
-
-    elif 32 <= last["rsi"] <= 48:
-
-        down += 2
-        reasons.append(
-            "Bearish RSI"
-        )
-
-    # MACD
-    if last["macd"] > last["macd_signal"]:
-
-        up += 2
-        reasons.append(
-            "MACD bullish"
-        )
-
-    elif last["macd"] < last["macd_signal"]:
-
-        down += 2
-        reasons.append(
-            "MACD bearish"
-        )
-
-    # Momentum
-    if last["momentum"] > 0:
-
-        up += 2
-        reasons.append(
-            "Positive momentum"
-        )
-
-    elif last["momentum"] < 0:
-
-        down += 2
-        reasons.append(
-            "Negative momentum"
-        )
-
-    # Candle
-    if last["body_ratio"] >= 0.55:
-
-        if last["close"] > last["open"]:
-
-            up += 2
-            reasons.append(
-                "Strong bullish candle"
-            )
-
-        elif last["close"] < last["open"]:
-
-            down += 2
-            reasons.append(
-                "Strong bearish candle"
-            )
-
-    # Recent structure
-    if len(df) >= 3:
-
-        recent_high = df[
-            "high"
-        ].iloc[-11:-1].max()
-
-        recent_low = df[
-            "low"
-        ].iloc[-11:-1].min()
-
-        if (
-            pd.notna(recent_high)
-            and
-            last["close"] > recent_high
-        ):
-
-            up += 2
-            reasons.append(
-                "High breakout"
-            )
-
-        elif (
-            pd.notna(recent_low)
-            and
-            last["close"] < recent_low
-        ):
-
-            down += 2
-            reasons.append(
-                "Low breakdown"
-            )
-
-    # Volatility
-    if (
-        pd.notna(last["atr"])
-        and
-        pd.notna(last["atr_avg"])
-        and
-        last["atr"] >=
-        last["atr_avg"] * 0.75
-    ):
-
-        if up > down:
-            up += 1
-
-        elif down > up:
-            down += 1
-
-    total = up + down
-
-    # Always UP or DOWN
-    if total == 0:
-
-        if last["close"] >= last["open"]:
-
-            return (
-                "UP",
-                50.0,
-                up,
-                down,
-                ["Bullish live candle bias"]
-            )
-
-        return (
-            "DOWN",
-            50.0,
-            up,
-            down,
-            ["Bearish live candle bias"]
-        )
-
-    if up >= down:
-
-        return (
-            "UP",
-            round(
-                up / total * 100,
-                1
-            ),
-            up,
-            down,
-            reasons
-        )
-
-    return (
-        "DOWN",
-        round(
-            down / total * 100,
-            1
-        ),
-        up,
-        down,
-        reasons
-    )
-
-
-# =========================================================
-# BACKTEST
-# =========================================================
-
-def run_backtest(df):
-
-    if df is None or len(df) < 62:
-
-        return None, 0, 0
-
-    wins = 0
-    losses = 0
-
-    for i in range(
-        60,
-        len(df) - 1
-    ):
-
-        historical = df.iloc[
-            :i + 1
-        ].copy()
-
-        signal, _, _, _, _ = get_signal(
-            historical
-        )
-
-        current = df.iloc[i]["close"]
-        next_price = df.iloc[
-            i + 1
-        ]["close"]
-
-        if signal == "UP":
-
-            win = next_price > current
-
-        else:
-
-            win = next_price < current
-
-        if win:
-            wins += 1
-        else:
-            losses += 1
-
-    total = wins + losses
-
-    if total == 0:
-        return None, wins, losses
-
-    accuracy = (
-        wins /
-        total *
-        100
-    )
-
-    return accuracy, wins, losses
-
-
-# =========================================================
-# APP
-# =========================================================
-
-st.title(
-    "📊 Live Trading Signal Bot"
-)
+st.title("📊 Live Trading Signal Bot")
 
 st.caption(
-    "Real live tick analysis + UP/DOWN signal"
+"Real-time market analysis + historical backtesting"
 )
 
 if not API_KEY:
+st.error("Twelve Data API key is missing.")
+st.stop()
 
-    st.error(
-        "TWELVE_DATA_API_KEY missing."
-    )
-
-    st.stop()
-
-
-pair = st.selectbox(
-    "Pair",
-    PAIRS
-)
+pair = st.selectbox("Pair", PAIRS)
 
 timeframe = st.selectbox(
-    "Timeframe",
-    list(TIMEFRAMES.keys())
+"Timeframe",
+list(TIMEFRAMES.keys())
 )
 
+if st.button(
+"🚀 START ANALYZE",
+use_container_width=True
+):
 
-collector = create_collector(
-    API_KEY
+with st.spinner("Analyzing market..."):  
+
+    df, error = get_data(  
+        pair,  
+        TIMEFRAMES[timeframe]  
+    )  
+
+    if error:  
+        st.error(error)  
+        st.stop()  
+
+    df = indicators(df)  
+
+    signal, strength, up, down, reasons = signal_engine(df)  
+
+    accuracy, wins, losses, history = backtest(df)  
+
+    price = df.iloc[-1]["close"]  
+
+st.success("Analysis completed")  
+
+st.metric(  
+    "Live Price",  
+    f"{price:.6f}"  
+)  
+
+if signal == "UP":  
+    st.success("🟢 SIGNAL: UP")  
+else:  
+    st.error("🔴 SIGNAL: DOWN")  
+
+st.metric(  
+    "Signal Strength",  
+    f"{strength}%"  
+)  
+
+st.divider()  
+
+col1, col2 = st.columns(2)  
+
+with col1:  
+    st.metric("UP Score", up)  
+
+with col2:  
+    st.metric("DOWN Score", down)  
+
+st.write("### 🧠 Analysis")  
+
+for reason in reasons:  
+    st.write("•", reason)  
+
+st.divider()  
+
+st.write("### 🧪 Historical Backtest")  
+
+c1, c2, c3 = st.columns(3)  
+
+with c1:  
+    st.metric(  
+        "Accuracy",  
+        f"{accuracy:.2f}%"  
+    )  
+
+with c2:  
+    st.metric(  
+        "WIN",  
+        wins  
+    )  
+
+with c3:  
+    st.metric(  
+        "LOSS",  
+        losses  
+    )  
+
+st.caption(  
+    f"Tested on {len(history)} historical signals."  
+)  
+
+st.write("### 🕒 Signal Time")  
+
+st.write(  
+    datetime.now().strftime(  
+        "%Y-%m-%d %H:%M:%S"  
+    )  
+)  
+ *
+st.warning(  
+    "Historical accuracy does not guarantee future results."  
 )
-
-collector.change_symbol(
-    pair
-)
-
-
-# =========================================================
-# START
-# =========================================================
-
-if "live" not in st.session_state:
-
-    st.session_state.live = False
-
-
-c1, c2 = st.columns(2)
-
-with c1:
-
-    if st.button(
-        "🚀 START ANALYZE",
-        use_container_width=True
-    ):
-
-        st.session_state.live = True
-
-with c2:
-
-    if st.button(
-        "⛔ STOP",
-        use_container_width=True
-    ):
-
-        st.session_state.live = False
-
-
-# =========================================================
-# LIVE DISPLAY
-# =========================================================
-
-if st.session_state.live:
-
-    @st.fragment(run_every=1)
-    def live_screen():
-
-        st.divider()
-
-        st.write(
-            "### 📡 Live Connection"
-        )
-
-        s1, s2, s3 = st.columns(3)
-
-        with s1:
-
-            if collector.connected:
-
-                st.success(
-                    "🟢 Connected"
-                )
-
-            else:
-
-                st.warning(
-                    "🟡 Connecting..."
-                )
-
-        with s2:
-
-            st.metric(
-                "Ticks",
-                collector.count()
-            )
-
-        with s3:
-
-            if collector.last_price:
-
-                st.metric(
-                    "Live Price",
-                    f"{collector.last_price:.6f}"
-                )
-
-            else:
-
-                st.metric(
-                    "Live Price",
-                    "---"
-                )
-
-        seconds = TIMEFRAMES[
-            timeframe
-        ]
-
-        # -------------------------------------------------
-        # 1 MINUTE
-        # -------------------------------------------------
-
-        if seconds == 60:
-
-            df, error = get_data(
-                pair
-            )
-
-            if error:
-
-                st.error(error)
-                return
-
-        # -------------------------------------------------
-        # SHORT TIMEFRAME
-        # -------------------------------------------------
-
-        else:
-
-            df = make_candles(
-                collector,
-                seconds
-            )
-
-            if df is None:
-
-                st.info(
-                    "⏳ Live ticks collect ho rahe hain..."
-                )
-
-                st.caption(
-                    "Real ticks milte hi "
-                    f"{seconds}-second candle banegi."
-                )
-
-                return
-
-        # -------------------------------------------------
-        # ANALYSIS
-        # -------------------------------------------------
-
-        df = add_indicators(
-            df
-        )
-
-        signal, strength, up, down, reasons = (
-            get_signal(df)
-        )
-
-        price = (
-            collector.last_price
-            if seconds != 60
-            and collector.last_price
-            else df.iloc[-1]["close"]
-        )
-
-        accuracy, wins, losses = (
-            run_backtest(df)
-        )
-
-        # -------------------------------------------------
-        # RESULT
-        # -------------------------------------------------
-
-        st.divider()
-
-        st.write(
-            f"### ⚡ {pair} — {timeframe}"
-        )
-
-        if signal == "UP":
-
-            st.success(
-                "🟢 SIGNAL: UP"
-            )
-
-        else:
-
-            st.error(
-                "🔴 SIGNAL: DOWN"
-            )
-
-        m1, m2, m3 = st.columns(3)
-
-        with m1:
-
-            st.metric(
-                "Live Price",
-                f"{price:.6f}"
-            )
-
-        with m2:
-
-            st.metric(
-                "Signal Strength",
-                f"{strength}%"
-            )
-
-        with m3:
-
-            st.metric(
-                "Candles",
-                len(df)
-            )
-
-        # -------------------------------------------------
-        # SCORES
-        # -------------------------------------------------
-
-        m4, m5 = st.columns(2)
-
-        with m4:
-
-            st.metric(
-                "🟢 UP Score",
-                up
-            )
-
-        with m5:
-
-            st.metric(
-                "🔴 DOWN Score",
-                down
-            )
-
-        # -------------------------------------------------
-        # REASONS
-        # -------------------------------------------------
-
-        st.write(
-            "### 🧠 Analysis"
-        )
-
-        for reason in reasons:
-
-            st.write(
-                "• " + reason
-            )
-
-        # -------------------------------------------------
-        # BACKTEST
-        # -------------------------------------------------
-
-        st.write(
-            "### 🧪 Historical Backtest"
-        )
-
-        if accuracy is not None:
-
-            b1, b2, b3 = st.columns(3)
-
-            with b1:
-
-                st.metric(
-                    "Accuracy",
-                    f"{accuracy:.2f}%"
-                )
-
-            with b2:
-
-                st.metric(
-                    "WIN",
-                    wins
-                )
-
-            with b3:
-
-                st.metric(
-                    "LOSS",
-                    losses
-                )
-
-        else:
-
-            st.info(
-                "5-second historical backtest ke liye "
-                "real candles abhi collect ho rahi hain."
-            )
-
-        st.caption(
-            "Last update: "
-            + datetime.now().strftime(
-                "%H:%M:%S"
-            )
-        )
-
-    live_screen()
