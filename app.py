@@ -334,7 +334,7 @@ st.write(
         "%Y-%m-%d %H:%M:%S"  
     )  
 )  
- *
+
 st.warning(  
     "Historical accuracy does not guarantee future results."  
 )
